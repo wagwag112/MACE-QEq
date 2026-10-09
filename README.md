@@ -231,13 +231,13 @@ The automated DFT manager (`stages/dispatch_dft.py`) executes a 300-second watch
 The generation recommendation in `convergence_report.json` is evaluated using strict quantitative gates:
 
 1. **Uncertainty Target Gate**:
-   $$\text{Fraction}\left(\sigma_{F,\text{p95}} \ge 0.100\text{ eV/Å}\right) \le 1.0\text{\%}$$
+   $$\text{Fraction}\left(\sigma_{F,\text{p95}} \ge 0.100\text{ eV/Å}\right) \le 1.0$$ %
 2. **Uncertainty Hard Ceiling Gate**:
-   $$\text{Fraction}\left(\sigma_{F,\text{p95}} \ge 0.150\text{ eV/Å}\right) == 0.0\text{\%}$$
+   $$\text{Fraction}\left(\sigma_{F,\text{p95}} \ge 0.150\text{ eV/Å}\right) == 0.0$$ %
 3. **Independent Test Generalization**:
-   $$\Delta \text{RMSE}_F(\text{Test}) \le 10.0\text{\%} \quad \text{relative to parent round}$$
+   $$\Delta \text{RMSE}_F(\text{Test}) \le 10.0$$ % relative to parent round
 4. **Historical Holdout Preservation**:
-   $$\Delta \text{RMSE}_F(\text{Holdout}_j) \le 20.0\text{\%} \quad \forall j \le k$$
+   $$\Delta \text{RMSE}_F(\text{Holdout}_j) \le 20.0$$ % $\quad \forall j \le k$
 5. **Enrichment Learning Condition**:
    $$\text{RMSE}_F^{(k)}(\text{Enrichment}_k) < \text{RMSE}_F^{(k-1)}(\text{Enrichment}_k)$$
 
