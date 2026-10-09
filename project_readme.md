@@ -16,7 +16,9 @@ $$E_{\text{Total}}(\mathbf{R}) = E_{\text{Short}}(\mathbf{R}) + E_{\text{QEq}}(\
 * **$E_{\text{Short}}$**: Non-electrostatic residual ($E_{\text{DFT}} - E_{\text{QEq}}$) fitted by the MACE potential.
 
 Corresponding atomic forces follow exact analytical derivatives:
-$$\mathbf{F}_i = -\nabla_{\mathbf{R}_i} E_{\text{Total}} = \mathbf{F}_i^{\text{Short}} + \mathbf{F}_i^{\text{QEq}}$$
+```math
+\mathbf{F}_i = -\nabla_{\mathbf{R}_i} E_{\text{Total}} = \mathbf{F}_i^{\text{Short}} + \mathbf{F}_i^{\text{QEq}}
+```
 
 ### 1.2 QEq Energy Formulation
 Under 3D periodic boundary conditions with slab geometry, $E_{\text{QEq}}$ is defined as:
