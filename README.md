@@ -235,7 +235,7 @@ The generation recommendation in `convergence_report.json` is evaluated using st
    \text{Fraction}\left(\sigma_{F,\text{p95}} \ge 0.100\text{ eV/Å}\right) \le 1.0\%
    '''
 3. **Uncertainty Hard Ceiling Gate**:
-   $$\text{Fraction}\left(\sigma_{F,\text{p95}} \ge 0.150\text{ eV/Å}\right) == 0.0\%$$
+   $$\text{Fraction}\left(\sigma_{F,\text{p95}} \ge 0.150\text{ eV/Å}\right) == 0.0\%$$%
 4. **Independent Test Generalization**:
    $$\Delta \text{RMSE}_F(\text{Test}) \le 10.0\% \quad \text{relative to parent round}$$
 5. **Historical Holdout Preservation**:
