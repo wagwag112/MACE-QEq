@@ -6,13 +6,6 @@ import sys
 import time
 from pathlib import Path
 import numpy as np
-import os
-try:
-    import torch
-    if not torch.cuda.is_available():
-        os.environ.setdefault("JAX_PLATFORMS", "cpu")
-except Exception:
-    pass
 import jax
 from ase import units
 from ase.io import read, write
@@ -33,16 +26,11 @@ for p in [SCRIPT_DIR, AL_DIR, PROJECT_ROOT]:
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-try:
-    import al_config as cfg
-except Exception:
-    cfg = None
-
-DEFAULT_STRUCTURE = getattr(cfg, "INPUT_STRUCTURE", PROJECT_ROOT / "structures" / f"{getattr(cfg, 'SYSTEM', 'Li_Li6PS5Cl')}_tv.vasp")
+DEFAULT_STRUCTURE = PROJECT_ROOT / "structures" / "Li_Li3N_tv.vasp"
 DEFAULT_MODEL = PROJECT_ROOT / "trained_models" / "train_short_v0" / "checkpoints" / "MACE_short_v0.model"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "debug_output"
 
-CONSTP_ANION_ELEMENT = "S"
+CONSTP_ANION_ELEMENT = "N"
 CONSTP_RCUT_ANION = 2.5
 CONSTP_RCUT_LILI = 3.5
 CONSTP_FIXED_PLANES_PER_SIDE = 2
@@ -63,10 +51,17 @@ PRODUCTION_QEQ_MAXITER = 100
 PRODUCTION_PME_POINTS_PER_ANG = 1.2
 PRODUCTION_PME_GRID_BLOCK = 4
 PRODUCTION_PME_GRID_MIN = 16
-DEFAULT_PAIR_CAPACITY_FACTOR = 1.1
+DEFAULT_PAIR_CAPACITY_FACTOR = 1.2
 DEFAULT_MAX_PAIRS = 0
 DEFAULT_QEQ_UPDATE_EVERY = 3
 DEFAULT_CN_CADENCE = 10
+
+jax.config.update("jax_enable_x64", True)
+
+try:
+    import al_config as cfg
+except Exception:
+    cfg = None
 
 def parse_anion_cutoffs(val) -> dict[str, float]:
     if val is None:
@@ -214,18 +209,12 @@ def determine_constp_chi(
     )
 
     is_metal = (symbols == metal_sym)
-    other_elements = set(symbols) - {metal_sym}
-    missing_cutoffs = other_elements - set(cutoffs.keys())
-    if missing_cutoffs:
-        raise RuntimeError(f"Missing coordination cutoff for element(s): {missing_cutoffs}")
-
-    other_bonds = np.zeros(len(pair_i), dtype=bool)
-    for a_sym in other_elements:
-        a_rc = cutoffs[a_sym]
+    anion_bonds = np.zeros(len(pair_i), dtype=bool)
+    for a_sym, a_rc in cutoffs.items():
         is_a = (symbols == a_sym)
-        other_bonds |= (is_metal[pair_i] & is_a[pair_j] & (d <= a_rc))
+        anion_bonds |= (is_metal[pair_i] & is_a[pair_j] & (d <= a_rc))
 
-    cn_anion = np.bincount(pair_i[other_bonds], minlength=natoms).astype(np.int32, copy=False)
+    cn_anion = np.bincount(pair_i[anion_bonds], minlength=natoms).astype(np.int32, copy=False)
 
     is_candidate = is_metal & (cn_anion == 0)
     is_candidate[bottom_seeds] = True
@@ -352,6 +341,21 @@ class MACEQEqCalculator(Calculator):
             model_paths=[str(model_path)],
             device=device,
         )
+        if self.mode == "full":
+            self.qeq = None
+            self.last_qeq = None
+            self.last_constp_diagnostics = None
+            self.electrode_tracker = None
+            self.system = None
+            self.dipole_axis = None
+            self.initial_z = np.asarray(atoms.positions[:, 2], dtype=np.float64).copy()
+            self.fixed_indices = (
+                np.asarray(fixed_indices, dtype=int).copy()
+                if fixed_indices is not None
+                else np.array([], dtype=int)
+            )
+            return
+
         self.system = get_system(atoms)
         self.dipole_axis = get_dipole_axis(atoms, self.system)
         self.include_dipole = self.dipole_axis is not None
@@ -431,6 +435,13 @@ class MACEQEqCalculator(Calculator):
         mace_atoms.calc = self.mace
         mace_energy = float(mace_atoms.get_potential_energy())
         mace_forces = np.asarray(mace_atoms.get_forces(), dtype=np.float64)
+
+        if self.mode == "full":
+            self.results["energy"] = mace_energy
+            self.results["forces"] = mace_forces
+            self.last_qeq = None
+            self.last_constp_diagnostics = None
+            return
 
         if self.mode == "constq" or (self.bottom_external_chi == 0.0 and self.upper_external_chi == 0.0):
             chi_eff = np.asarray(self.qeq.chi, dtype=np.float64)
@@ -512,7 +523,7 @@ def zero_fixed_momenta(atoms, fixed_indices):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Unified ConstP / ConstQ MD using MACE-short + QEq.")
-    parser.add_argument("--mode", choices=["constp", "constq"], default="constp")
+    parser.add_argument("--mode", choices=["constp", "constq", "full"], default="constp")
     parser.add_argument("--structure", default=str(DEFAULT_STRUCTURE))
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE_K)
@@ -744,7 +755,6 @@ def main():
             if constp_n_fixed_in_electrode != len(fixed_indices):
                 raise RuntimeError("Electrode assignment lost fixed seeds.")
 
-        atoms.info["time_ps"] = float(time_ps)
         thermo.writerow([
             step,
             time_ps,
@@ -783,15 +793,15 @@ def main():
 
         if not np.isfinite(epot) or not np.all(np.isfinite(forces)) or not np.isfinite(temperature_mobile):
             raise RuntimeError(f"Non-finite trajectory step {step}.")
-        if abs(qeq_sum) > 1.0e-6:
-            raise RuntimeError(f"Neutrality broken at step {step}: sum(q)={qeq_sum}")
-        if qeq_pairs >= qeq_capacity:
-            raise RuntimeError(f"QEq pair list exhausted at step {step}.")
+        if calc.last_qeq is not None:
+            if abs(qeq_sum) > 1.0e-6:
+                raise RuntimeError(f"Neutrality broken at step {step}: sum(q)={qeq_sum}")
+            if qeq_pairs >= qeq_capacity:
+                raise RuntimeError(f"QEq pair list exhausted at step {step}.")
         if temperature_mobile > 3000.0 or fmax > 100.0:
             raise RuntimeError(f"Instability abort at step {step}: Tmob={temperature_mobile:.1f} K, Fmax={fmax:.3f} eV/A.")
 
     dyn.attach(save_frame, interval=args.save_every)
-    save_frame()
 
     try:
         dyn.run(args.steps)
