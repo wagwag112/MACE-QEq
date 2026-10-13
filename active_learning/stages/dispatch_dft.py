@@ -160,7 +160,7 @@ def main():
             if st == "PENDING":
                 elapsed = now - info["submit_time"]
                 is_blocked = any(br in reason for br in BLOCKING_REASONS)
-                if is_blocked and elapsed >= 1800 and info["retries"] < MAX_RETRIES:
+                if is_blocked and elapsed >= 1800:
                     curr_part = info["partition"]
                     next_part = partitions[(partitions.index(curr_part) + 1) % n_part]
                     up = subprocess.run(["scontrol", "update", f"JobId={jid}", f"Partition={next_part}"], capture_output=True, text=True)
@@ -168,7 +168,7 @@ def main():
                         print(f"[RE-ROUTE] Job {jid} ({calc_path.name}): {curr_part} -> {next_part} (Reason: {reason})")
                         info["partition"] = next_part
                         info["submit_time"] = now
-                        info["retries"] += 1
+                        info["reroutes"] = info.get("reroutes", 0) + 1
                         updated = True
 
             elif st in {"UNKNOWN", "FAILED", "TIMEOUT", "CANCELLED", "NODE_FAIL"}:
