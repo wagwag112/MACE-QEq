@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=al_probe_score
-#SBATCH --partition=gpuexpress,himsa40,requeue-gpu
+#SBATCH --partition=himsa40,requeue-gpu
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
