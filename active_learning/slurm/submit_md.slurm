@@ -12,15 +12,17 @@
 
 set -eo pipefail
 
-PROJ_ROOT="/scratch/tmp/hdang/projects/Li_Li3N"
-CLUSTER_ENV="${PROJ_ROOT}/active_learning/slurm/cluster_config.sh"
+PROJ_ROOT="/work/hoang0000/Li_Li3N"
+CLUSTER_ENV="/work/hoang0000/Li_LPSC/MACE_QEq/active_learning/cluster_config.sh"
+[[ -f "${CLUSTER_ENV}" ]] || CLUSTER_ENV="${PROJ_ROOT}/active_learning/cluster_config.sh"
 DRIVER="${PROJ_ROOT}/active_learning/stages/run_md.py"
 
-TASK_NAME="task2_constq_50ps"
-MODE="constq"
-STRUCT="${PROJ_ROOT}/structures/Li_Li3N_tv.vasp"
+TASK_NAME="constP1_6_-2_new"
+MODE="constp"
+STRUCT="${PROJ_ROOT}/structures/Li_Li3N_Li_new.vasp"
 MODEL="${PROJ_ROOT}/trained_models/train_short_v1/MACE_short_v1.model"
-STEPS=50000
+STEPS=100000
+RESTART=1
 
 TEMP_K=300
 TIMESTEP_FS=1.0
@@ -30,7 +32,7 @@ DEVICE="cuda"
 
 PLANES_PER_SIDE=3
 PLANE_TOL=0.35
-PAIR_CAPACITY_FACTOR=1.2
+PAIR_CAPACITY_FACTOR=1.15
 
 ACTIVE_METAL="Li"
 ANION_CUTOFFS="N:2.50"
@@ -55,11 +57,11 @@ fi
 source "${CLUSTER_ENV}"
 load_gpu_environment
 
-export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
-PYTHON="${MACE_ENV}/bin/python"
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
+PYTHON="${PYTHON:-${MACE_ENV}/bin/python}"
 
 if [[ ! -x "${PYTHON}" ]]; then
-    echo "ERROR: Python executable not found: ${PYTHON}" >&2
+    echo "ERROR: Python executable missing or non-executable: ${PYTHON}" >&2
     exit 1
 fi
 if [[ ! -s "${STRUCT}" ]]; then
@@ -67,17 +69,22 @@ if [[ ! -s "${STRUCT}" ]]; then
     exit 1
 fi
 if [[ ! -s "${MODEL}" ]]; then
-    echo "ERROR: Model missing or empty: ${MODEL}" >&2
+    echo "ERROR: Model checkpoint missing or empty: ${MODEL}" >&2
     exit 1
 fi
 
 EXPECTED_FRAMES=$((STEPS / SAVE_EVERY + 1))
-if [[ -s "${OUT_DIR}/md.extxyz" ]]; then
+if [[ "${RESTART}" != "1" && -s "${OUT_DIR}/md.extxyz" ]]; then
     DONE_FRAMES=$(grep -c "Lattice=" "${OUT_DIR}/md.extxyz" || true)
     if (( DONE_FRAMES >= EXPECTED_FRAMES - 2 )); then
         echo "[SKIP] ${TASK_NAME} already complete: ${DONE_FRAMES}/${EXPECTED_FRAMES} frames."
         exit 0
     fi
+fi
+
+if [[ "${RESTART}" == "0" && -s "${OUT_DIR}/md.traj" ]]; then
+    echo "ERROR: Existing trajectory detected. Refusing fresh run."
+    exit 1
 fi
 
 cd "${PROJ_ROOT}"
@@ -101,6 +108,10 @@ CMD_ARGS=(
     "--output=${OUT_DIR}"
 )
 
+if [[ "${RESTART}" == "1" ]]; then
+    CMD_ARGS+=("--restart")
+fi
+
 if [[ "${MODE}" == "constp" ]]; then
     CMD_ARGS+=(
         "--bottom-external-chi=${BOTTOM_EXTERNAL_CHI}"
@@ -115,3 +126,4 @@ echo "[MD] steps=${STEPS} timestep_fs=${TIMESTEP_FS} temperature_K=${TEMP_K}"
 echo "[MD] output=${OUT_DIR}"
 
 "${PYTHON}" -u "${DRIVER}" "${CMD_ARGS[@]}"
+
