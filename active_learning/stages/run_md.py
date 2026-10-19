@@ -2,10 +2,20 @@
 from __future__ import annotations
 import argparse
 import csv
+import json
+import hashlib
+import shutil
 import sys
 import time
 from pathlib import Path
 import numpy as np
+import os
+try:
+    import torch
+    if not torch.cuda.is_available():
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
+except Exception:
+    pass
 import jax
 from ase import units
 from ase.io import read, write
@@ -26,14 +36,19 @@ for p in [SCRIPT_DIR, AL_DIR, PROJECT_ROOT]:
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-DEFAULT_STRUCTURE = PROJECT_ROOT / "structures" / "Li_Li3N_tv.vasp"
+try:
+    import al_config as cfg
+except Exception:
+    cfg = None
+
+DEFAULT_STRUCTURE = getattr(cfg, "INPUT_STRUCTURE", PROJECT_ROOT / "structures" / f"{getattr(cfg, 'SYSTEM', 'Li_Li6PS5Cl')}_tv.vasp")
 DEFAULT_MODEL = PROJECT_ROOT / "trained_models" / "train_short_v0" / "checkpoints" / "MACE_short_v0.model"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "debug_output"
 
-CONSTP_ANION_ELEMENT = "N"
+CONSTP_ANION_ELEMENT = "S"
 CONSTP_RCUT_ANION = 2.5
 CONSTP_RCUT_LILI = 3.5
-CONSTP_FIXED_PLANES_PER_SIDE = 3
+CONSTP_FIXED_PLANES_PER_SIDE = 2
 CONSTP_FIXED_PLANE_TOL = 0.35
 
 DEFAULT_BOTTOM_EXTERNAL_CHI = 0.0
@@ -46,22 +61,15 @@ DEFAULT_SAVE_EVERY = 100
 DEFAULT_SEED = 2333
 DEFAULT_DEVICE = "cuda"
 
-PRODUCTION_QEQ_TOL = 1.0e-4
+PRODUCTION_QEQ_TOL = 1.0e-5
 PRODUCTION_QEQ_MAXITER = 100
 PRODUCTION_PME_POINTS_PER_ANG = 1.2
 PRODUCTION_PME_GRID_BLOCK = 4
 PRODUCTION_PME_GRID_MIN = 16
-DEFAULT_PAIR_CAPACITY_FACTOR = 1.15
+DEFAULT_PAIR_CAPACITY_FACTOR = 1.1
 DEFAULT_MAX_PAIRS = 0
 DEFAULT_QEQ_UPDATE_EVERY = 3
 DEFAULT_CN_CADENCE = 10
-
-jax.config.update("jax_enable_x64", True)
-
-try:
-    import al_config as cfg
-except Exception:
-    cfg = None
 
 def parse_anion_cutoffs(val) -> dict[str, float]:
     if val is None:
@@ -209,12 +217,18 @@ def determine_constp_chi(
     )
 
     is_metal = (symbols == metal_sym)
-    anion_bonds = np.zeros(len(pair_i), dtype=bool)
-    for a_sym, a_rc in cutoffs.items():
-        is_a = (symbols == a_sym)
-        anion_bonds |= (is_metal[pair_i] & is_a[pair_j] & (d <= a_rc))
+    other_elements = set(symbols) - {metal_sym}
+    missing_cutoffs = other_elements - set(cutoffs.keys())
+    if missing_cutoffs:
+        raise RuntimeError(f"Missing coordination cutoff for element(s): {missing_cutoffs}")
 
-    cn_anion = np.bincount(pair_i[anion_bonds], minlength=natoms).astype(np.int32, copy=False)
+    other_bonds = np.zeros(len(pair_i), dtype=bool)
+    for a_sym in other_elements:
+        a_rc = cutoffs[a_sym]
+        is_a = (symbols == a_sym)
+        other_bonds |= (is_metal[pair_i] & is_a[pair_j] & (d <= a_rc))
+
+    cn_anion = np.bincount(pair_i[other_bonds], minlength=natoms).astype(np.int32, copy=False)
 
     is_candidate = is_metal & (cn_anion == 0)
     is_candidate[bottom_seeds] = True
@@ -341,21 +355,6 @@ class MACEQEqCalculator(Calculator):
             model_paths=[str(model_path)],
             device=device,
         )
-        if self.mode == "full":
-            self.qeq = None
-            self.last_qeq = None
-            self.last_constp_diagnostics = None
-            self.electrode_tracker = None
-            self.system = None
-            self.dipole_axis = None
-            self.initial_z = np.asarray(atoms.positions[:, 2], dtype=np.float64).copy()
-            self.fixed_indices = (
-                np.asarray(fixed_indices, dtype=int).copy()
-                if fixed_indices is not None
-                else np.array([], dtype=int)
-            )
-            return
-
         self.system = get_system(atoms)
         self.dipole_axis = get_dipole_axis(atoms, self.system)
         self.include_dipole = self.dipole_axis is not None
@@ -435,13 +434,6 @@ class MACEQEqCalculator(Calculator):
         mace_atoms.calc = self.mace
         mace_energy = float(mace_atoms.get_potential_energy())
         mace_forces = np.asarray(mace_atoms.get_forces(), dtype=np.float64)
-
-        if self.mode == "full":
-            self.results["energy"] = mace_energy
-            self.results["forces"] = mace_forces
-            self.last_qeq = None
-            self.last_constp_diagnostics = None
-            return
 
         if self.mode == "constq" or (self.bottom_external_chi == 0.0 and self.upper_external_chi == 0.0):
             chi_eff = np.asarray(self.qeq.chi, dtype=np.float64)
@@ -523,7 +515,7 @@ def zero_fixed_momenta(atoms, fixed_indices):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Unified ConstP / ConstQ MD using MACE-short + QEq.")
-    parser.add_argument("--mode", choices=["constp", "constq", "full"], default="constp")
+    parser.add_argument("--mode", choices=["constp", "constq"], default="constp")
     parser.add_argument("--structure", default=str(DEFAULT_STRUCTURE))
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE_K)
@@ -548,9 +540,60 @@ def parse_args():
     parser.add_argument("--rcut-anion", type=float, default=CONSTP_RCUT_ANION)
     parser.add_argument("--rcut-lili", type=float, default=CONSTP_RCUT_LILI)
     parser.add_argument("--anion-symbol", default=CONSTP_ANION_ELEMENT)
+    parser.add_argument("--restart", action="store_true")
     parser.add_argument("--output", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--device", default=DEFAULT_DEVICE)
     return parser.parse_args()
+
+def atomic_json(path, data):
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as handle:
+        json.dump(data, handle, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fixed_from_constraints(atoms):
+    indices = []
+    for constraint in atoms.constraints:
+        if isinstance(constraint, FixAtoms):
+            indices.extend(int(i) for i in constraint.get_indices())
+    return np.unique(indices).astype(int)
+
+
+def tracker_data(tracker, step):
+    return {
+        "step": int(step), "natoms": tracker.natoms,
+        "previous_mask": tracker.previous_mask.astype(int).tolist() if tracker.previous_mask is not None else None,
+        "n_evaluations": int(tracker.n_evaluations),
+        "total_enter": int(tracker.total_enter),
+        "total_leave": int(tracker.total_leave),
+        "total_switch": int(tracker.total_switch),
+        "enter_counts": tracker.enter_counts.tolist(),
+        "leave_counts": tracker.leave_counts.tolist(),
+    }
+
+
+def restore_tracker(tracker, data):
+    if data["natoms"] != tracker.natoms:
+        raise RuntimeError("Tracker atom count changed")
+    tracker.previous_mask = None if data["previous_mask"] is None else np.array(data["previous_mask"], dtype=bool)
+    tracker.n_evaluations = int(data["n_evaluations"])
+    tracker.total_enter = int(data["total_enter"])
+    tracker.total_leave = int(data["total_leave"])
+    tracker.total_switch = int(data["total_switch"])
+    tracker.enter_counts = np.array(data["enter_counts"], dtype=np.int64)
+    tracker.leave_counts = np.array(data["leave_counts"], dtype=np.int64)
+
 
 def main():
     args = parse_args()
@@ -568,7 +611,68 @@ def main():
         raise ValueError("qeq_update_every must be >= 1.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    atoms = read(structure_file, index=0)
+    traj_file = output_dir / "md.traj"
+    extxyz_file = output_dir / "md.extxyz"
+    thermo_file = output_dir / "thermo.csv"
+
+    metadata_file = output_dir / "md_run_metadata.json"
+    tracker_file = output_dir / "md_tracker_state.json"
+    restart_step = 0
+    old_tracker_state = None
+    stored_fixed = None
+    old_metadata = None
+    if args.restart:
+        for path in (traj_file, extxyz_file, thermo_file):
+            if not path.is_file() or path.stat().st_size == 0:
+                raise RuntimeError(f"Missing restart file: {path}")
+        with open(thermo_file, newline="") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            raise RuntimeError("Restart thermo.csv contains no data")
+        restart_step = int(rows[-1]["step"])
+        if restart_step < 0 or restart_step % args.save_every:
+            raise RuntimeError("Restart step incompatible with save interval")
+        expected_steps = list(range(0, restart_step + 1, args.save_every))
+        steps_present = [int(row["step"]) for row in rows]
+        unique_steps = list(dict.fromkeys(steps_present))
+        if unique_steps != expected_steps or any(a > b for a, b in zip(steps_present, steps_present[1:])):
+            raise RuntimeError("Thermo steps have gaps, regressions, or incompatible intervals")
+        if len(steps_present) != len(unique_steps):
+            print("[WARN] Legacy trajectory contains duplicate boundary frames; preserved unchanged", flush=True)
+        if not np.isclose(float(rows[-1]["time_ps"]), restart_step * args.timestep_fs / 1000, atol=1e-6):
+            raise RuntimeError("Restart timestep/time mismatch")
+        with Trajectory(traj_file, "r") as previous:
+            if len(previous) != len(rows):
+                raise RuntimeError(f"Trajectory/thermo frame count mismatch: {len(previous)} != {len(rows)}")
+            atoms = previous[-1].copy()
+        if "time_ps" in atoms.info:
+            if not np.isclose(float(atoms.info["time_ps"]), float(rows[-1]["time_ps"]), atol=1e-6):
+                raise RuntimeError("Last trajectory time differs from thermo.csv")
+        else:
+            print("[RESTART] md.traj has no time_ps metadata; using validated thermo.csv steps and frame counts", flush=True)
+        if "momenta" not in atoms.arrays:
+            raise RuntimeError("Trajectory lacks momenta; cannot safely restart")
+        # Count extxyz frames without parsing their (possibly very large) atomic arrays.
+        with open(extxyz_file, encoding="utf-8") as f:
+            xyz_frame_count = sum('Lattice=' in line for line in f)
+        if xyz_frame_count != len(rows):
+            raise RuntimeError(f"extxyz/thermo frame count mismatch: {xyz_frame_count} != {len(rows)}")
+        if metadata_file.exists():
+            old_metadata = json.loads(metadata_file.read_text())
+            stored_fixed = old_metadata.get("fixed_indices")
+        if tracker_file.exists():
+            old_tracker_state = json.loads(tracker_file.read_text())
+            if int(old_tracker_state["step"]) != restart_step:
+                raise RuntimeError("Tracker state is not synchronized with trajectory")
+        elif restart_step and args.mode == "constp":
+            print("[WARN] Legacy run has no tracker state; cumulative switching will restart from zero", flush=True)
+        print(f"[RESTART] validated step={restart_step} frames={len(rows)}", flush=True)
+    else:
+        existing = [path for path in (traj_file, extxyz_file, thermo_file) if path.exists()]
+        if existing:
+            raise RuntimeError("Output files already exist; use --restart or a new output directory: " + str(existing))
+        atoms = read(structure_file, index=0)
+
     natoms = len(atoms)
 
     active_metal = args.active_metal or getattr(cfg, "ACTIVE_METAL", "Li")
@@ -580,13 +684,29 @@ def main():
     else:
         anion_cutoffs = {args.anion_symbol: args.rcut_anion}
 
-    if args.mode == "constp" or args.planes_per_side > 0:
-        fixed_bottom_indices, fixed_upper_indices, fixed_indices = identify_fixed_metal_planes(
-            atoms,
-            metal_symbol=active_metal,
-            planes_per_side=args.planes_per_side,
-            plane_tol=args.plane_tol,
-        )
+    needs_fixed = args.mode == "constp" or args.planes_per_side > 0
+    if needs_fixed:
+        if args.restart:
+            original = read(structure_file, index=0)
+            if len(original) != natoms or not np.array_equal(original.numbers, atoms.numbers):
+                raise RuntimeError("Restart structure and trajectory have different atoms/order")
+            if stored_fixed is not None:
+                fixed_indices = np.asarray(stored_fixed, dtype=int)
+                fixed_bottom_indices = np.asarray(old_metadata["fixed_bottom_indices"], dtype=int)
+                fixed_upper_indices = np.asarray(old_metadata["fixed_upper_indices"], dtype=int)
+            else:
+                # Legacy trajectories: derive electrode seeds from the original structure, never the final frame.
+                fixed_bottom_indices, fixed_upper_indices, fixed_indices = identify_fixed_metal_planes(
+                    original, metal_symbol=active_metal,
+                    planes_per_side=args.planes_per_side, plane_tol=args.plane_tol)
+                print("[WARN] Legacy restart: fixed indices recovered from initial structure", flush=True)
+            current_fixed = fixed_from_constraints(atoms)
+            if len(current_fixed) and not np.array_equal(current_fixed, fixed_indices):
+                raise RuntimeError("Saved fixed constraints disagree with original/metadata")
+        else:
+            fixed_bottom_indices, fixed_upper_indices, fixed_indices = identify_fixed_metal_planes(
+                atoms, metal_symbol=active_metal,
+                planes_per_side=args.planes_per_side, plane_tol=args.plane_tol)
         atoms.set_constraint(FixAtoms(indices=fixed_indices))
         mobile_indices = np.setdiff1d(np.arange(natoms, dtype=int), fixed_indices, assume_unique=False)
     else:
@@ -597,6 +717,39 @@ def main():
 
     if len(mobile_indices) == 0:
         raise RuntimeError("All atoms are fixed; no mobile atoms remain.")
+
+    identity = {
+        "mode": args.mode,
+        "structure_sha256": file_hash(structure_file),
+        "model_sha256": file_hash(model_file),
+        "natoms": natoms,
+        "timestep_fs": args.timestep_fs,
+        "temperature_K": args.temperature,
+        "ttime_fs": args.ttime_fs,
+        "save_every": args.save_every,
+        "planes_per_side": args.planes_per_side,
+        "plane_tol": args.plane_tol,
+        "fixed_indices": fixed_indices.tolist(),
+        "fixed_bottom_indices": fixed_bottom_indices.tolist(),
+        "fixed_upper_indices": fixed_upper_indices.tolist(),
+        "active_metal": active_metal,
+        "anion_cutoffs": anion_cutoffs,
+        "rcut_metal": rcut_metal,
+        "bottom_external_chi": args.bottom_external_chi if args.mode == "constp" else 0.0,
+        "upper_external_chi": args.upper_external_chi if args.mode == "constp" else 0.0,
+        "qeq_update_every": args.qeq_update_every,
+        "cn_cadence": args.cn_cadence,
+        "qeq_tol": args.qeq_tol,
+        "pme_points_per_ang": args.pme_points_per_ang,
+        "pair_capacity_factor": args.pair_capacity_factor,
+        "max_pairs": args.max_pairs,
+    }
+    if args.restart and old_metadata is not None:
+        incompatible = [k for k, value in identity.items() if old_metadata.get(k) != value]
+        if incompatible:
+            raise RuntimeError(f"Restart settings changed: {incompatible}")
+    if args.restart and old_metadata is None:
+        print("[WARN] Legacy run lacks metadata; model and settings cannot all be verified", flush=True)
 
     calc = MACEQEqCalculator(
         model_path=model_file,
@@ -623,8 +776,9 @@ def main():
     )
     atoms.calc = calc
 
-    rng = np.random.default_rng(args.seed)
-    MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature, rng=rng)
+    if not args.restart:
+        rng = np.random.default_rng(args.seed)
+        MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature, rng=rng)
     if len(fixed_indices) > 0:
         zero_fixed_momenta(atoms, fixed_indices)
 
@@ -632,6 +786,24 @@ def main():
     initial_forces = np.asarray(atoms.get_forces(), dtype=np.float64)
     if not np.isfinite(initial_energy) or not np.all(np.isfinite(initial_forces)):
         raise RuntimeError("Non-finite initial state detected.")
+
+    if args.restart and old_tracker_state is not None and calc.electrode_tracker is not None:
+        restore_tracker(calc.electrode_tracker, old_tracker_state)
+        # The initial force evaluation has already reconstructed ConstP diagnostics.
+        # Keep cached data but align cumulative counters with the restored tracker.
+        if calc.last_constp_diagnostics is not None:
+            diag = calc.last_constp_diagnostics
+            diag.update({
+                "n_evaluations": calc.electrode_tracker.n_evaluations,
+                "total_enter": calc.electrode_tracker.total_enter,
+                "total_leave": calc.electrode_tracker.total_leave,
+                "total_switch": calc.electrode_tracker.total_switch,
+                "n_enter": 0, "n_leave": 0, "n_switch": 0,
+            })
+    if not args.restart:
+        atomic_json(metadata_file, identity)
+    elif old_metadata is None:
+        atomic_json(metadata_file, identity)
 
     dyn = FixAtomsAwareNPT(
         atoms,
@@ -645,14 +817,16 @@ def main():
     extxyz_file = output_dir / "md.extxyz"
     thermo_file = output_dir / "thermo.csv"
 
-    for path in [traj_file, extxyz_file, thermo_file]:
-        if path.exists():
-            path.unlink()
+    if not args.restart:
+        for path in [traj_file, extxyz_file, thermo_file]:
+            if path.exists():
+                path.unlink()
 
-    traj = Trajectory(traj_file, "w")
-    thermo_handle = open(thermo_file, "w", newline="")
+    traj = Trajectory(traj_file, "a" if args.restart else "w")
+    thermo_handle = open(thermo_file, "a" if args.restart else "w", newline="")
     thermo = csv.writer(thermo_handle)
-    thermo.writerow([
+    if not args.restart:
+        thermo.writerow([
         "step",
         "time_ps",
         "temperature_ASE_K",
@@ -686,7 +860,7 @@ def main():
     ])
 
     def save_frame():
-        step = dyn.get_number_of_steps()
+        step = restart_step + dyn.get_number_of_steps()
         time_ps = step * args.timestep_fs / 1000.0
         epot = float(atoms.get_potential_energy())
         ekin = float(atoms.get_kinetic_energy())
@@ -755,6 +929,7 @@ def main():
             if constp_n_fixed_in_electrode != len(fixed_indices):
                 raise RuntimeError("Electrode assignment lost fixed seeds.")
 
+        atoms.info["time_ps"] = float(time_ps)
         thermo.writerow([
             step,
             time_ps,
@@ -790,18 +965,24 @@ def main():
         thermo_handle.flush()
         traj.write(atoms)
         write(extxyz_file, atoms, format="extxyz", append=True)
+        if calc.electrode_tracker is not None:
+            atomic_json(tracker_file, tracker_data(calc.electrode_tracker, step))
 
         if not np.isfinite(epot) or not np.all(np.isfinite(forces)) or not np.isfinite(temperature_mobile):
             raise RuntimeError(f"Non-finite trajectory step {step}.")
-        if calc.last_qeq is not None:
-            if abs(qeq_sum) > 1.0e-6:
-                raise RuntimeError(f"Neutrality broken at step {step}: sum(q)={qeq_sum}")
-            if qeq_pairs >= qeq_capacity:
-                raise RuntimeError(f"QEq pair list exhausted at step {step}.")
+        if abs(qeq_sum) > 1.0e-6:
+            raise RuntimeError(f"Neutrality broken at step {step}: sum(q)={qeq_sum}")
+        if qeq_pairs >= qeq_capacity:
+            raise RuntimeError(f"QEq pair list exhausted at step {step}.")
         if temperature_mobile > 3000.0 or fmax > 100.0:
             raise RuntimeError(f"Instability abort at step {step}: Tmob={temperature_mobile:.1f} K, Fmax={fmax:.3f} eV/A.")
 
-    dyn.attach(save_frame, interval=args.save_every)
+    def scheduled_save():
+        if args.restart and dyn.get_number_of_steps() == 0:
+            return
+        save_frame()
+
+    dyn.attach(scheduled_save, interval=args.save_every)
 
     try:
         dyn.run(args.steps)
@@ -810,6 +991,8 @@ def main():
         traj.close()
 
     if calc.electrode_tracker is not None:
+        if args.restart:
+            calc.initial_z = read(structure_file, index=0).positions[:, 2].copy()
         switch_csv = output_dir / "switching_atoms.csv"
         tracker = calc.electrode_tracker
         with open(switch_csv, "w", newline="") as f:
