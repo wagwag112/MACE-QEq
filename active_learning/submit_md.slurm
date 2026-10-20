@@ -1,14 +1,14 @@
 #!/bin/bash
-#SBATCH --job-name=md_runner
-#SBATCH --partition=himsa40,requeue-gpu
-#SBATCH --gres=gpu:1
+#SBATCH -A MST115294
+#SBATCH -J constP1_4_0
+#SBATCH -p 8gpus
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=24:00:00
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
+#SBATCH --gpus-per-node=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=12
+#SBATCH --time=1-00:00:00
+#SBATCH --output=%j.out
+#SBATCH --error=%j.err
 
 set -eo pipefail
 
