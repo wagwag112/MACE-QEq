@@ -1,23 +1,34 @@
 from pathlib import Path
 
-ROOT = Path("/scratch/tmp/hdang/projects/Li_Li3N")
+ROOT = Path("/scratch/tmp/hdang/projects/Li_Li6PS5Cl")
 PROJECT_ROOT = ROOT
 
 ROUND = 1
 PARENT_ROUND = 0
 ANODE = "Li"
-SE = "Li3N"
-SYSTEM = "Li_Li3N"
+SE = "Li6PS5Cl"
+SYSTEM = f"{ANODE}_{SE}"
 
-ACTIVE_METAL = "Li"
+ACTIVE_METAL = ANODE
 RCUT_METAL = 3.50
-ANION_CUTOFFS = {
+MIN_CLUSTER_SIZE = 8
+
+SE_ELEMENT_CUTOFFS = {
     "N": 2.50,
     "P": 2.80,
     "S": 2.90,
     "Cl": 3.05,
 }
+ANION_CUTOFFS = SE_ELEMENT_CUTOFFS
+NON_METAL_CUTOFFS = SE_ELEMENT_CUTOFFS
 
+CHI_HARDNESS_TABLE = {
+    "Li": (-3.0000, 10.0241),
+    "N": (7.6100, 7.7500),
+    "P": (1.8000, 7.0946),
+    "S": (6.5745, 9.0000),
+    "Cl": (9.9704, 6.1703),
+}
 EXPLORATION_MODE = "constp"
 BOTTOM_EXTERNAL_CHI = 6.0
 UPPER_EXTERNAL_CHI = -2.0
@@ -28,7 +39,7 @@ SAVE_EVERY = 10
 MD_SEED = 20261004
 TTIME_FS = 20.0
 
-PAIR_CAPACITY_FACTOR = 1.15
+PAIR_CAPACITY_FACTOR = 1.2
 MAX_PAIRS = 0
 DEVICE = "cuda"
 
@@ -96,7 +107,7 @@ PARENT_VALID_SHORT = DATA_DIR / "valid_short.extxyz"
 
 TRAINED_MODELS_ROOT = ROOT / "trained_models"
 
-PRETRAINED_MACE_MODEL = Path("/scratch/tmp/hdang/projects/Li_Li3N/trained_models/mace-mpa-0-medium.model")
+PRETRAINED_MACE_MODEL = TRAINED_MODELS_ROOT / "mace-mpa-0-medium.model"
 
 V0_BOOTSTRAP_DIR = MD_ROOT / "v0_bootstrap"
 V0_TRAJ_DIR = V0_BOOTSTRAP_DIR / "trajectories"
@@ -105,14 +116,14 @@ V0_TARGET_COUNT = 400
 
 V0_SPECS = {
     "test": {
-        "Li": {"n_frames": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / "Li_test.vasp"},
-        "Li3N": {"n_frames": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / "Li3N_test.vasp"},
-        "Li_Li3N": {"n_frames": 80, "dt_ps": 0.5, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / "Li_Li3N_test.vasp"},
+        ANODE: {"n_frames": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{ANODE}_test.vasp"},
+        SE: {"n_frames": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{SE}_test.vasp"},
+        SYSTEM: {"n_frames": 80, "dt_ps": 0.5, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{SYSTEM}_test.vasp"},
     },
     "tv": {
-        "Li": {"n_train": 50, "n_valid": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / "Li_tv.vasp"},
-        "Li3N": {"n_train": 50, "n_valid": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / "Li3N_tv.vasp"},
-        "Li_Li3N": {"n_train": 100, "n_valid": 80, "dt_ps": 0.5, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / "Li_Li3N_tv.vasp"},
+        ANODE: {"n_train": 50, "n_valid": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{ANODE}_tv.vasp"},
+        SE: {"n_train": 50, "n_valid": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{SE}_tv.vasp"},
+        SYSTEM: {"n_train": 100, "n_valid": 80, "dt_ps": 0.5, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{SYSTEM}_tv.vasp"},
     },
 }
 
@@ -215,6 +226,8 @@ def validate_config():
         raise RuntimeError("ACTIVE_METAL cannot be empty.")
     if RCUT_METAL <= 0.0:
         raise RuntimeError("RCUT_METAL must be positive.")
+    if MIN_CLUSTER_SIZE < 1:
+        raise RuntimeError("MIN_CLUSTER_SIZE must be positive.")
     if not isinstance(ANION_CUTOFFS, dict) or not ANION_CUTOFFS:
         raise RuntimeError("ANION_CUTOFFS must be a non-empty dictionary.")
     for sym, rcut in ANION_CUTOFFS.items():
@@ -259,10 +272,10 @@ validate_config()
 
 DFT_PARTITIONS = [
     "normal", "long", "requeue", "requeue-zen", "zen4",
-    "himszen4", "hims", "requeue-gpu", "q0heuer"
+    "himszen4", "q0heuer"
 ]
 DFT_CPUS_PER_JOB = 24
-DFT_TIME_LIMIT = "12:00:00"
+DFT_TIME_LIMIT = "24:00:00"
 
 DFT_ROOT = ROOT / "DFT"
 DFT_CALC_DIR = DFT_ROOT / f"v{ROUND}" / "cal"
