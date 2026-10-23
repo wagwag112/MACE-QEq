@@ -1,359 +1,192 @@
 #!/usr/bin/env python3
 
 import numpy as np
+from ase.constraints import FixAtoms
 from ase.io import iread
+from ase.neighborlist import neighbor_list
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
-# ===================== PARAMETERS =====================
-
-FILE = "/work/hoang0000/Li_Li6PS5Cl/md_validation/4vs2/md.extxyz"
+FILE = "/work/hoang0000/Li_Li6PS5Cl/md_validation/constQ/md.extxyz"
 
 TIMESTEP_FS = 1.0
 SAVE_EVERY = 100
-
 SAMPLE_EVERY_PS = 0.5
+
+BASELINE_PS = 10.0
 WINDOW_PS = 5.0
-MIN_TIME_PS = 20.0
-CONSECUTIVE_WINDOWS = 3
-
+CONSECUTIVE_WINDOWS = 4
 RELATIVE_TOL = 0.10
-MIX_AUTO_STABLE_A = 1.0
 
-INTERFACE_WIDTH_A = 8.0
-PENETRATION_MARGIN_A = 1.0
-
-# ======================================================
+RCUT_METAL = 3.50
+OTHER_CUTOFFS = {"N": 2.50, "P": 2.80, "S": 2.90, "Cl": 3.05}
 
 
-def detect_geometry(atoms):
-    symbols = np.array(atoms.get_chemical_symbols())
-    nonli = symbols != "Li"
-    li = ~nonli
+def get_seeds(atoms):
+    fixed = []
+    for constraint in atoms.constraints:
+        if isinstance(constraint, FixAtoms):
+            fixed.extend(constraint.get_indices())
 
-    if not np.any(nonli):
-        raise ValueError("No non-Li atoms found.")
+    fixed = np.unique(fixed).astype(int)
+    symbols = np.asarray(atoms.get_chemical_symbols())
 
-    candidates = []
+    if not len(fixed) or not np.all(symbols[fixed] == "Li"):
+        raise ValueError("Trajectory must contain fixed Li electrode seeds.")
 
-    for axis in range(3):
-        x = atoms.positions[:, axis]
+    z = atoms.positions[:, 2]
+    midpoint = 0.5 * (z[fixed].min() + z[fixed].max())
+    bottom = fixed[z[fixed] < midpoint]
+    upper = fixed[z[fixed] > midpoint]
 
-        lo = np.min(x[nonli])
-        hi = np.max(x[nonli])
+    if not len(bottom) or not len(upper):
+        raise ValueError("Cannot identify both fixed seed layers.")
 
-        left = li & (x < lo)
-        right = li & (x > hi)
+    return bottom, upper
 
-        if np.any(left) and np.any(right):
-            candidates.append((
-                min(np.sum(left), np.sum(right)),
-                axis, lo, hi, left, right
-            ))
 
-    if not candidates:
-        raise ValueError(
-            "Cannot detect Li|electrolyte|Li geometry."
+def count_electrode_li(atoms, bottom, upper):
+    symbols = np.asarray(atoms.get_chemical_symbols())
+    other = set(symbols) - {"Li"}
+
+    missing = other - set(OTHER_CUTOFFS)
+    if missing:
+        raise ValueError(f"Missing coordination cutoffs: {sorted(missing)}")
+
+    max_rc = max([RCUT_METAL] + [OTHER_CUTOFFS[s] for s in other])
+    i, j, d = neighbor_list("ijd", atoms, max_rc, self_interaction=False)
+
+    is_li = symbols == "Li"
+    other_bonds = np.zeros(len(i), dtype=bool)
+    for symbol in other:
+        other_bonds |= (
+            is_li[i]
+            & (symbols[j] == symbol)
+            & (d <= OTHER_CUTOFFS[symbol])
         )
 
-    _, axis, lo, hi, left, right = max(
-        candidates, key=lambda x: x[0]
+    cn_other = np.bincount(i[other_bonds], minlength=len(atoms))
+    candidate = is_li & (cn_other <= 1)
+    candidate[bottom] = True
+    candidate[upper] = True
+
+    bonds = candidate[i] & candidate[j] & (d <= RCUT_METAL)
+    graph = csr_matrix(
+        (np.ones(np.count_nonzero(bonds), dtype=bool), (i[bonds], j[bonds])),
+        shape=(len(atoms), len(atoms)),
     )
+    _, labels = connected_components(graph, directed=False)
 
-    electrolyte_li = li & ~left & ~right
+    bottom_labels = np.unique(labels[bottom])
+    upper_labels = np.unique(labels[upper])
 
-    return {
-        "axis": axis,
-        "lo": lo,
-        "hi": hi,
-        "left_li": left,
-        "right_li": right,
-        "electrolyte_li": electrolyte_li,
-        "nonli": nonli,
-    }
+    if np.intersect1d(bottom_labels, upper_labels).size:
+        raise RuntimeError("Candidate graph connects both electrodes.")
 
-
-def unwrap_positions(previous, current, cell_length):
-    delta = current - previous
-    delta -= cell_length * np.round(delta / cell_length)
-    return delta
-
-
-def measure(x, geometry):
-    lo = geometry["lo"]
-    hi = geometry["hi"]
-
-    left_li = geometry["left_li"]
-    right_li = geometry["right_li"]
-    nonli = geometry["nonli"]
-
-    margin = PENETRATION_MARGIN_A
-    width = INTERFACE_WIDTH_A
-
-    result = {}
-
-    # Left interface
-    left_nonli_pen = np.sum(
-        nonli & (x < lo - margin)
-    )
-
-    left_li_pen = np.sum(
-        left_li & (x > lo + margin)
-    )
-
-    left_nonli_region = x[
-        nonli & (x >= lo - width) & (x <= lo + width)
-    ]
-
-    left_li_region = x[
-        left_li & (x >= lo - width) & (x <= lo + width)
-    ]
-
-    # Right interface
-    right_nonli_pen = np.sum(
-        nonli & (x > hi + margin)
-    )
-
-    right_li_pen = np.sum(
-        right_li & (x < hi - margin)
-    )
-
-    right_nonli_region = x[
-        nonli & (x >= hi - width) & (x <= hi + width)
-    ]
-
-    right_li_region = x[
-        right_li & (x >= hi - width) & (x <= hi + width)
-    ]
-
-    def mixing_width(a, b):
-        if len(a) < 2 or len(b) < 2:
-            return 0.0
-
-        a_low, a_high = np.percentile(a, [10, 90])
-        b_low, b_high = np.percentile(b, [10, 90])
-
-        return max(
-            0.0,
-            min(a_high, b_high) - max(a_low, b_low)
-        )
-
-    result["left"] = np.array([
-        left_nonli_pen,
-        left_li_pen,
-        mixing_width(left_nonli_region, left_li_region)
+    return np.array([
+        np.count_nonzero(candidate & np.isin(labels, bottom_labels)),
+        np.count_nonzero(candidate & np.isin(labels, upper_labels)),
     ], dtype=float)
-
-    result["right"] = np.array([
-        right_nonli_pen,
-        right_li_pen,
-        mixing_width(right_nonli_region, right_li_region)
-    ], dtype=float)
-
-    return result
-
-
-def stable(previous, current):
-    if current[2] < MIX_AUTO_STABLE_A:
-        return True
-
-    for idx in range(3):
-        old = previous[idx]
-        new = current[idx]
-
-        if old == 0:
-            if new != 0:
-                return False
-            continue
-
-        relative_change = abs(new - old) / abs(old)
-
-        if relative_change > RELATIVE_TOL:
-            return False
-
-    return True
 
 
 def main():
     frame_dt = TIMESTEP_FS * SAVE_EVERY / 1000.0
+    baseline_frames = round(BASELINE_PS / frame_dt)
+    window_frames = round(WINDOW_PS / frame_dt)
 
-    stride = max(
-        1, round(SAMPLE_EVERY_PS / frame_dt)
-    )
+    if (
+        baseline_frames < 1
+        or window_frames < 1
+        or not np.isclose(baseline_frames * frame_dt, BASELINE_PS)
+        or not np.isclose(window_frames * frame_dt, WINDOW_PS)
+    ):
+        raise ValueError("Analysis times must align with saved frames.")
 
-    sample_dt = stride * frame_dt
-
-    if sample_dt > WINDOW_PS:
-        raise ValueError(
-            "Sampling interval exceeds analysis window."
-        )
-
-    trajectory = iread(FILE, index=f"::{stride}")
-
-    first = next(trajectory, None)
-
-    if first is None:
-        raise ValueError("Empty trajectory.")
-
-    geometry = detect_geometry(first)
-
-    axis = geometry["axis"]
-    length = np.linalg.norm(first.cell[axis])
-
-    if length <= 0:
-        raise ValueError("Invalid cell length.")
-
-    previous_wrapped = first.positions[:, axis].copy()
-    unwrapped = previous_wrapped.copy()
-
-    records = []
-
-    records.append((
-        0.0,
-        measure(unwrapped, geometry)
-    ))
-
-    for k, atoms in enumerate(trajectory, start=1):
-        if len(atoms) != len(first):
-            raise ValueError("Atom count changed.")
-
-        current = atoms.positions[:, axis]
-
-        displacement = unwrap_positions(
-            previous_wrapped, current, length
-        )
-
-        unwrapped += displacement
-        previous_wrapped = current.copy()
-
-        t = k * sample_dt
-
-        records.append((
-            t,
-            measure(unwrapped, geometry)
-        ))
-
-    print("=" * 92)
-    print("CONSTQ INTERFACE EQUILIBRATION ANALYSIS")
-    print("=" * 92)
-    print(f"File             : {FILE}")
-    print(f"Detected axis    : {'xyz'[axis]}")
-    print(f"Electrolyte range: {geometry['lo']:.2f} - {geometry['hi']:.2f} Ã…")
-    print(f"Frame dt         : {frame_dt:.4f} ps")
-    print(f"Sampling interval: {sample_dt:.4f} ps")
-    print(f"Frames analyzed  : {len(records)}")
-    print(f"Duration         : {records[-1][0]:.2f} ps")
-    print("-" * 92)
+    bottom = upper = None
+    initial_numbers = None
+    initial_count = previous_count = baseline_rate = None
+    consecutive = 0
+    first_stop = None
+    last_time = None
 
     print(
-        f"{'Window':>12} "
-        f"{'Side':>6} "
-        f"{'NonLi->Li':>12} "
-        f"{'Li->SE':>12} "
-        f"{'Mix(A)':>10} "
-        f"{'Status':>12}"
+        f"{'Window(ps)':>12} {'RateB(Li/ps)':>14} "
+        f"{'RateU(Li/ps)':>14} {'Status':>9} {'Streak':>7}"
     )
 
-    window_results = []
-
-    total_time = records[-1][0]
-    n_windows = int((total_time + 1e-8) // WINDOW_PS)
-
-    for k in range(n_windows):
-        start = k * WINDOW_PS
-        end = (k + 1) * WINDOW_PS
-
-        selected = [
-            values for t, values in records
-            if start < t <= end + 1e-8
-        ]
-
+    for frame, atoms in enumerate(iread(FILE, index=":")):
+        selected = (
+            frame == 0
+            or (
+                frame >= baseline_frames
+                and (frame - baseline_frames) % window_frames == 0
+            )
+        )
         if not selected:
             continue
 
-        means = {
-            side: np.mean(
-                [v[side] for v in selected], axis=0
-            )
-            for side in ("left", "right")
-        }
-
-        window_results.append(
-            (start, end, means)
-        )
-
-    consecutive = 0
-    first_stop = None
-
-    for k, (start, end, means) in enumerate(window_results):
-        eligible = (
-            end >= MIN_TIME_PS
-            and k > 0
-        )
-
-        if eligible:
-            previous = window_results[k - 1][2]
-
-            left_ok = stable(
-                previous["left"], means["left"]
-            )
-
-            right_ok = stable(
-                previous["right"], means["right"]
-            )
-
-            both_ok = left_ok and right_ok
-
-            consecutive = (
-                consecutive + 1 if both_ok else 0
-            )
-        else:
-            left_ok = False
-            right_ok = False
-            consecutive = 0
-
-        for side, ok in (
-            ("left", left_ok),
-            ("right", right_ok),
+        expected_time = frame * frame_dt
+        t = float(atoms.info.get("time_ps", expected_time))
+        if not np.isfinite(t) or not np.isclose(
+            t, expected_time, rtol=0.0, atol=1e-6
         ):
-            values = means[side]
+            raise ValueError("Trajectory time does not match frame indexing.")
 
-            if not eligible:
-                status = "WAIT"
-            elif ok:
-                status = "STABLE"
-            else:
-                status = "ACTIVE"
+        if frame == 0:
+            bottom, upper = get_seeds(atoms)
+            initial_numbers = atoms.numbers.copy()
 
+        if not np.array_equal(atoms.numbers, initial_numbers):
+            raise ValueError("Atom count or ordering changed.")
+
+        current_count = count_electrode_li(atoms, bottom, upper)
+
+        if frame == 0:
+            initial_count = current_count
+            continue
+
+        if frame == baseline_frames:
+            baseline_rate = (current_count - initial_count) / BASELINE_PS
+            previous_count = current_count
+            last_time = t
             print(
-                f"{start:5.0f}-{end:<5.0f} "
-                f"{side:>6} "
-                f"{values[0]:12.2f} "
-                f"{values[1]:12.2f} "
-                f"{values[2]:10.3f} "
-                f"{status:>12}"
+                f"Baseline 0-{BASELINE_PS:g} ps: "
+                f"bottom={baseline_rate[0]:.6f}, "
+                f"upper={baseline_rate[1]:.6f} Li/ps"
             )
+            continue
 
-        if (
-            consecutive >= CONSECUTIVE_WINDOWS
-            and first_stop is None
-        ):
-            first_stop = end
+        rate = (current_count - previous_count) / WINDOW_PS
+        stable_sides = (
+            (np.abs(rate) <= 1.0)
+            | (np.abs(rate) < RELATIVE_TOL * np.abs(baseline_rate))
+        )
+        stable = bool(np.all(stable_sides))
+        consecutive = consecutive + 1 if stable else 0
 
-    print("=" * 92)
-
-    if first_stop is not None:
         print(
-            f"First equilibrium criterion reached: "
-            f"{first_stop:.2f} ps"
+            f"{last_time:5.0f}-{t:<6.0f} "
+            f"{rate[0]:14.6f} {rate[1]:14.6f} "
+            f"{'STABLE' if stable else 'ACTIVE':>9} "
+            f"{consecutive:7d}"
         )
 
-    if total_time < MIN_TIME_PS:
-        print("DECISION: INSUFFICIENT DATA")
-    elif consecutive >= CONSECUTIVE_WINDOWS:
-        print("DECISION: STOP CONSTQ")
-    else:
-        print("DECISION: CONTINUE CONSTQ")
+        previous_count = current_count
+        last_time = t
 
-    print("=" * 92)
+        if consecutive >= CONSECUTIVE_WINDOWS and first_stop is None:
+            first_stop = t
+
+    if baseline_rate is None:
+        print("DECISION: INSUFFICIENT DATA")
+    else:
+        if first_stop is not None:
+            print(f"First stop criterion reached: {first_stop:.2f} ps")
+        print(
+            "DECISION: STOP CONSTQ"
+            if consecutive >= CONSECUTIVE_WINDOWS
+            else "DECISION: CONTINUE CONSTQ"
+        )
 
 
 if __name__ == "__main__":
