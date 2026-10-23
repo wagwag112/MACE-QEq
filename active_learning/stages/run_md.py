@@ -69,7 +69,7 @@ PRODUCTION_PME_GRID_MIN = 16
 DEFAULT_PAIR_CAPACITY_FACTOR = 1.1
 DEFAULT_MAX_PAIRS = 0
 DEFAULT_QEQ_UPDATE_EVERY = 3
-DEFAULT_CN_CADENCE = 10
+DEFAULT_CN_CADENCE = 9
 
 def parse_anion_cutoffs(val) -> dict[str, float]:
     if val is None:
@@ -230,7 +230,7 @@ def determine_constp_chi(
 
     cn_anion = np.bincount(pair_i[other_bonds], minlength=natoms).astype(np.int32, copy=False)
 
-    is_candidate = is_metal & (cn_anion == 0)
+    is_candidate = is_metal & (cn_anion <= 1)
     is_candidate[bottom_seeds] = True
     is_candidate[upper_seeds] = True
 
