@@ -1,193 +1,128 @@
-#!/usr/bin/env python3
-
+import sys
 import numpy as np
-from ase.constraints import FixAtoms
-from ase.io import iread
+from ase.io import read
 from ase.neighborlist import neighbor_list
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import connected_components
 
-FILE = "/work/hoang0000/Li_Li6PS5Cl/md_validation/constQ/md.extxyz"
+traj_file = sys.argv[1] if len(sys.argv) > 1 else "md.traj"
+traj = read(traj_file, index=":")
 
-TIMESTEP_FS = 1.0
-SAVE_EVERY = 100
-SAMPLE_EVERY_PS = 0.5
+atoms_init = traj[0]
+atoms_curr = traj[-1]
+symbols = np.array(atoms_curr.get_chemical_symbols())
 
-BASELINE_PS = 10.0
-WINDOW_PS = 5.0
-CONSECUTIVE_WINDOWS = 4
-RELATIVE_TOL = 0.10
+box = atoms_curr.get_cell()
+z_mid = box[2, 2] / 2.0
 
-RCUT_METAL = 3.50
-OTHER_CUTOFFS = {"N": 2.50, "P": 2.80, "S": 2.90, "Cl": 3.05}
+li_idx = np.where(symbols == "Li")[0]
+li_set = set(li_idx)
 
+ANION_CUTOFFS = {
+    "N": 2.50,
+    "P": 2.80,
+    "S": 2.90,
+    "Cl": 3.05,
+}
 
-def get_seeds(atoms):
-    fixed = []
-    for constraint in atoms.constraints:
-        if isinstance(constraint, FixAtoms):
-            fixed.extend(constraint.get_indices())
+ELECTROLYTE_CN_MIN = 2
 
-    fixed = np.unique(fixed).astype(int)
-    symbols = np.asarray(atoms.get_chemical_symbols())
-
-    if not len(fixed) or not np.all(symbols[fixed] == "Li"):
-        raise ValueError("Trajectory must contain fixed Li electrode seeds.")
-
-    z = atoms.positions[:, 2]
-    midpoint = 0.5 * (z[fixed].min() + z[fixed].max())
-    bottom = fixed[z[fixed] < midpoint]
-    upper = fixed[z[fixed] > midpoint]
-
-    if not len(bottom) or not len(upper):
-        raise ValueError("Cannot identify both fixed seed layers.")
-
-    return bottom, upper
-
-
-def count_electrode_li(atoms, bottom, upper):
-    symbols = np.asarray(atoms.get_chemical_symbols())
-    other = set(symbols) - {"Li"}
-
-    missing = other - set(OTHER_CUTOFFS)
-    if missing:
-        raise ValueError(f"Missing coordination cutoffs: {sorted(missing)}")
-
-    max_rc = max([RCUT_METAL] + [OTHER_CUTOFFS[s] for s in other])
-    i, j, d = neighbor_list("ijd", atoms, max_rc, self_interaction=False)
-
-    is_li = symbols == "Li"
-    other_bonds = np.zeros(len(i), dtype=bool)
-    for symbol in other:
-        other_bonds |= (
-            is_li[i]
-            & (symbols[j] == symbol)
-            & (d <= OTHER_CUTOFFS[symbol])
-        )
-
-    cn_other = np.bincount(i[other_bonds], minlength=len(atoms))
-    candidate = is_li & (cn_other <= 1)
-    candidate[bottom] = True
-    candidate[upper] = True
-
-    bonds = candidate[i] & candidate[j] & (d <= RCUT_METAL)
-    graph = csr_matrix(
-        (np.ones(np.count_nonzero(bonds), dtype=bool), (i[bonds], j[bonds])),
-        shape=(len(atoms), len(atoms)),
+def get_bulk_li(atoms):
+    i_li, j_li, d_li = neighbor_list(
+        "ijd", atoms, max(ANION_CUTOFFS.values())
     )
-    _, labels = connected_components(graph, directed=False)
+    symbols_local = np.array(atoms.get_chemical_symbols())
+    cn = {idx: 0 for idx in li_idx}
 
-    bottom_labels = np.unique(labels[bottom])
-    upper_labels = np.unique(labels[upper])
+    for i, j, d in zip(i_li, j_li, d_li):
+        if i in li_set and symbols_local[j] in ANION_CUTOFFS:
+            if d <= ANION_CUTOFFS[symbols_local[j]]:
+                cn[i] += 1
 
-    if np.intersect1d(bottom_labels, upper_labels).size:
-        raise RuntimeError("Candidate graph connects both electrodes.")
+    return cn
 
-    return np.array([
-        np.count_nonzero(candidate & np.isin(labels, bottom_labels)),
-        np.count_nonzero(candidate & np.isin(labels, upper_labels)),
-    ], dtype=float)
+cn_init = get_bulk_li(atoms_init)
+cn_curr = get_bulk_li(atoms_curr)
 
+pos_init = atoms_init.positions
+pos_curr = atoms_curr.positions
 
-def main():
-    frame_dt = TIMESTEP_FS * SAVE_EVERY / 1000.0
-    baseline_frames = round(BASELINE_PS / frame_dt)
-    window_frames = round(WINDOW_PS / frame_dt)
+# Classify electrodes along Z
+# Bottom Li: z < z_mid | Upper Li: z > z_mid
+# Li with CN_anion < 2 is classified as electrode Li
+bottom_li_init = [
+    i for i in li_idx
+    if pos_init[i, 2] < z_mid and cn_init[i] < ELECTROLYTE_CN_MIN
+]
+bottom_li_curr = [
+    i for i in li_idx
+    if pos_curr[i, 2] < z_mid and cn_curr[i] < ELECTROLYTE_CN_MIN
+]
+delta_bottom = len(bottom_li_curr) - len(bottom_li_init)
 
-    if (
-        baseline_frames < 1
-        or window_frames < 1
-        or not np.isclose(baseline_frames * frame_dt, BASELINE_PS)
-        or not np.isclose(window_frames * frame_dt, WINDOW_PS)
-    ):
-        raise ValueError("Analysis times must align with saved frames.")
+upper_li_init = [
+    i for i in li_idx
+    if pos_init[i, 2] > z_mid and cn_init[i] < ELECTROLYTE_CN_MIN
+]
+upper_li_curr = [
+    i for i in li_idx
+    if pos_curr[i, 2] > z_mid and cn_curr[i] < ELECTROLYTE_CN_MIN
+]
+delta_upper = len(upper_li_curr) - len(upper_li_init)
 
-    bottom = upper = None
-    initial_numbers = None
-    initial_count = previous_count = baseline_rate = None
-    consecutive = 0
-    first_stop = None
-    last_time = None
-
-    print(
-        f"{'Window(ps)':>12} {'RateB(Li/ps)':>14} "
-        f"{'RateU(Li/ps)':>14} {'Status':>9} {'Streak':>7}"
+# Bulk Li thickness along Z
+if len(bottom_li_curr) > 0:
+    thick_bottom = (
+        np.max(pos_curr[bottom_li_curr, 2])
+        - np.min(pos_curr[bottom_li_curr, 2])
     )
+else:
+    thick_bottom = 0.0
 
-    for frame, atoms in enumerate(iread(FILE, index=":")):
-        selected = (
-            frame == 0
-            or (
-                frame >= baseline_frames
-                and (frame - baseline_frames) % window_frames == 0
-            )
-        )
-        if not selected:
-            continue
+if len(upper_li_curr) > 0:
+    thick_upper = (
+        np.max(pos_curr[upper_li_curr, 2])
+        - np.min(pos_curr[upper_li_curr, 2])
+    )
+else:
+    thick_upper = 0.0
 
-        expected_time = frame * frame_dt
-        t = float(atoms.info.get("time_ps", expected_time))
-        if not np.isfinite(t) or not np.isclose(
-            t, expected_time, rtol=0.0, atol=1e-6
-        ):
-            raise ValueError("Trajectory time does not match frame indexing.")
+# LPSC core integrity along Z
+p_core = [
+    i for i, s in enumerate(symbols)
+    if s == "P" and abs(pos_curr[i, 2] - z_mid) < 8.0
+]
 
-        if frame == 0:
-            bottom, upper = get_seeds(atoms)
-            initial_numbers = atoms.numbers.copy()
+s_indices = set(np.where(symbols == "S")[0])
+i_p, j_p, d_p = neighbor_list("ijd", atoms_curr, 2.45)
 
-        if not np.array_equal(atoms.numbers, initial_numbers):
-            raise ValueError("Atom count or ordering changed.")
+cn_p = {idx: 0 for idx in p_core}
+for i, j in zip(i_p, j_p):
+    if i in cn_p and j in s_indices:
+        cn_p[i] += 1
 
-        current_count = count_electrode_li(atoms, bottom, upper)
+mean_cn_p = (
+    np.mean(list(cn_p.values()))
+    if len(p_core) > 0 else 0.0
+)
 
-        if frame == 0:
-            initial_count = current_count
-            continue
+print(f"=== ELECTRODE ANALYSIS ALONG Z (Frames: {len(traj)}) ===")
+print(f"Electrolyte-like Li criterion: CN_anion >= {ELECTROLYTE_CN_MIN}")
 
-        if frame == baseline_frames:
-            baseline_rate = (current_count - initial_count) / BASELINE_PS
-            previous_count = current_count
-            last_time = t
-            print(
-                f"Baseline 0-{BASELINE_PS:g} ps: "
-                f"bottom={baseline_rate[0]:.6f}, "
-                f"upper={baseline_rate[1]:.6f} Li/ps"
-            )
-            continue
+print(f"\nBottom Electrode Li (z < {z_mid:.1f} A):")
+print(
+    f"  - Electrode atoms (CN_anion < {ELECTROLYTE_CN_MIN}): "
+    f"Start = {len(bottom_li_init)}, End = {len(bottom_li_curr)}"
+)
+print(f"  - Atom count change (Delta N): {delta_bottom:+d} atoms")
+print(f"  - Electrode thickness: {thick_bottom:.2f} A")
 
-        rate = (current_count - previous_count) / WINDOW_PS
-        stable_sides = (
-            (np.abs(rate) <= 1.0)
-            | (np.abs(rate) < RELATIVE_TOL * np.abs(baseline_rate))
-        )
-        stable = bool(np.all(stable_sides))
-        consecutive = consecutive + 1 if stable else 0
+print(f"\nUpper Electrode Li (z > {z_mid:.1f} A):")
+print(
+    f"  - Electrode atoms (CN_anion < {ELECTROLYTE_CN_MIN}): "
+    f"Start = {len(upper_li_init)}, End = {len(upper_li_curr)}"
+)
+print(f"  - Atom count change (Delta N): {delta_upper:+d} atoms")
+print(f"  - Electrode thickness: {thick_upper:.2f} A")
 
-        print(
-            f"{last_time:5.0f}-{t:<6.0f} "
-            f"{rate[0]:14.6f} {rate[1]:14.6f} "
-            f"{'STABLE' if stable else 'ACTIVE':>9} "
-            f"{consecutive:7d}"
-        )
-
-        previous_count = current_count
-        last_time = t
-
-        if consecutive >= CONSECUTIVE_WINDOWS and first_stop is None:
-            first_stop = t
-
-    if baseline_rate is None:
-        print("DECISION: INSUFFICIENT DATA")
-    else:
-        if first_stop is not None:
-            print(f"First stop criterion reached: {first_stop:.2f} ps")
-        print(
-            "DECISION: STOP CONSTQ"
-            if consecutive >= CONSECUTIVE_WINDOWS
-            else "DECISION: CONTINUE CONSTQ"
-        )
-
-
-if __name__ == "__main__":
-    main()
+print(f"\nLPSC Core Integrity (z_mid +/- 8 A):")
+print(f"  - P atoms in core: {len(p_core)}")
+print(f"  - Mean P-S coordination: {mean_cn_p:.2f}")
