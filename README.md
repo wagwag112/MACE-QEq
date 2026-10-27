@@ -175,7 +175,7 @@ Round 0 uses **nine distinct input structures**: three systems × three independ
 | Li | `Li_train.vasp` | `Li_valid.vasp` | `Li_test.vasp` | 50 | 10 | 10 |
 | Li6PS5Cl | `Li6PS5Cl_train.vasp` | `Li6PS5Cl_valid.vasp` | `Li6PS5Cl_test.vasp` | 50 | 10 | 10 |
 | Li_Li6PS5Cl | `Li_Li6PS5Cl_train.vasp` | `Li_Li6PS5Cl_valid.vasp` | `Li_Li6PS5Cl_test.vasp` | 100 | 50 | 50 |
-| **Total** | **9 inputs** | | | **200** | **70** | **70** |
+| **Total** | **9 inputs** | **200** | **70** | **70** |
 
 **Total Round-0 output: 340 labeled configurations**, not 400. The 3 interface tasks use pretrained-model MD sampling; the 6 bulk tasks use deterministic `displacement`, `strain`, and `rattle` perturbations. The interface MD sampler uses a 1 fs step, 2 ps equilibration, 0.5 ps sampled-frame interval, and role-specific random seeds. The bulk sampler cycles over the three perturbation methods and applies configured displacement, strain, and rattle ranges.
 
