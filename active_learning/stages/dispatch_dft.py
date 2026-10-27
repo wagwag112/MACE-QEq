@@ -13,7 +13,7 @@ if str(AL_DIR) not in sys.path:
 
 import al_config as cfg
 
-CHECK_INTERVAL_SEC = 300
+CHECK_INTERVSEC = 300
 MAX_RETRIES = 5
 BLOCKING_REASONS = {"Priority", "Resources", "ReqNodeNotAvail", "Nodes_required_for_job_are_DOWN_or_DRAINED"}
 CORRUPT_FILES = [
@@ -103,7 +103,25 @@ def query_slurm(job_ids: list[str]):
                 status_map[parts[0].strip()] = (parts[1].strip(), parts[2].strip() if len(parts) > 2 else "")
     return status_map
 
+def save_tracking(tracking_file: Path, tracking: dict) -> None:
+    tracking_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tracking_file.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(tracking, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, tracking_file)
+
 def main():
+    if "--dry-run" in sys.argv:
+        calc_root = cfg.ROOT / "DFT" / f"v{cfg.ROUND}" / "cal"
+        print(f"ROUND={cfg.ROUND}")
+        print(f"CALC_ROOT={calc_root}")
+        print(f"EXPECTED_JOBS={cfg.V0_TARGET_COUNT if cfg.ROUND == 0 else cfg.N_SELECTED}")
+        print(f"TEMPLATE_ROOT={cfg.DFT_TEMPLATE_DIR}")
+        print(f"RUN_SCRIPT={cfg.DFT_RUN_SCRIPT}")
+        print("DRY RUN COMPLETE: no files modified, no jobs submitted")
+        return
     if cfg.ROUND != 0:
         import stages.prepare_dft as prep
         rows = prep.load_manifest()
@@ -113,7 +131,7 @@ def main():
     partitions = cfg.DFT_PARTITIONS
     n_part = len(partitions)
     calc_dirs = get_cal_dirs()
-    tracking_file = cfg.ACTIVE_LEARNING_DIR / "state" / f"dft_v{cfg.ROUND}_jobs.json"
+    tracking_file = cfg.PROJECT_ROOT / "active_learning_state" / f"dft_v{cfg.ROUND}_jobs.json"
     tracking = {}
     if tracking_file.is_file():
         with open(tracking_file, "r") as f:
@@ -131,9 +149,7 @@ def main():
                 "submit_time": time.time(),
                 "retries": 0,
             }
-        tracking_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(tracking_file, "w") as f:
-            json.dump(tracking, f, indent=2)
+            save_tracking(tracking_file, tracking)
 
     while True:
         completed = sum(1 for d in calc_dirs if is_vasprun_valid(d))
@@ -187,10 +203,22 @@ def main():
                     updated = True
 
         if updated:
-            with open(tracking_file, "w") as f:
-                json.dump(tracking, f, indent=2)
+            save_tracking(tracking_file, tracking)
 
-        time.sleep(CHECK_INTERVAL_SEC)
+        exhausted = [
+            p for p, info in tracking.items()
+            if not is_vasprun_valid(Path(p))
+            and info["retries"] >= MAX_RETRIES
+            and slurm_statuses.get(info["job_id"], ("UNKNOWN", ""))[0]
+            not in {"PENDING", "RUNNING", "COMPLETING", "CONFIGURING"}
+        ]
+        if exhausted:
+            raise RuntimeError(
+                f"DFT retry limit exceeded for {len(exhausted)} calculations: "
+                + ", ".join(exhausted[:10])
+            )
+
+        time.sleep(CHECK_INTERVSEC)
 
 if __name__ == "__main__":
     main()

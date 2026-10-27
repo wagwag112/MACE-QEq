@@ -80,13 +80,16 @@ def analyze_evaluation(summary: pd.DataFrame) -> dict:
 
     holdout_results = []
     catastrophic_holdout_fail = False
-    holdouts = [n for n in sorted(set(summary["dataset"])) if n.startswith("v") and n.endswith("_holdout")]
+    holdouts = [f"v{generation}_holdout" for generation in range(1, cfg.ROUND + 1)]
 
     for d in holdouts:
         p_rows = summary[(summary["generation"] == f"v{cfg.PARENT_ROUND}") & (summary["dataset"] == d) & (summary["system"] == "ALL")]
         c_rows = summary[(summary["generation"] == f"v{cfg.ROUND}") & (summary["dataset"] == d) & (summary["system"] == "ALL")]
         if len(p_rows) != 1 or len(c_rows) != 1:
-            continue
+            raise RuntimeError(
+                f"{d}: expected exactly one parent and current ALL-system evaluation; "
+                f"found parent={len(p_rows)}, current={len(c_rows)}."
+            )
         p = p_rows.iloc[0]
         c = c_rows.iloc[0]
         f_chg = safe_pct_change(float(p["F_RMSE_full_eV_A"]), float(c["F_RMSE_full_eV_A"]))
@@ -171,6 +174,47 @@ def decide_recommendation(evaluation: dict, probe: dict) -> tuple[str, list[str]
         reasons.append("Short+QEq did not improve on enrichment set.")
     return "REVIEW", reasons
 
+def write_historical_errors(current_summary: pd.DataFrame) -> tuple[Path, Path]:
+    summary_rows = []
+    element_rows = []
+    for generation in range(cfg.ROUND + 1):
+        evaluation_dir = cfg.MD_ROOT / f"active_learning_v{generation}" / "validation" / "evaluation"
+        prefix = f"v{generation}_standalone" if generation == 0 else f"v{generation - 1}_vs_v{generation}"
+        for suffix, output in (("summary", summary_rows), ("elements", element_rows)):
+            path = evaluation_dir / f"{prefix}_{suffix}.csv"
+            if generation == cfg.ROUND and suffix == "summary":
+                df = current_summary
+            elif path.is_file() and path.stat().st_size > 0:
+                df = pd.read_csv(path)
+            else:
+                continue
+            required = {"generation", "dataset"}
+            if not required.issubset(df.columns):
+                raise RuntimeError(f"Historical evaluation columns missing: {path}")
+            selected = df[(df["generation"] == f"v{generation}") & (df["dataset"] == "independent_test")].copy()
+            if not selected.empty:
+                output.append(selected)
+
+    def save_history(rows, suffix, columns):
+        if rows:
+            df = pd.concat(rows, ignore_index=True)
+            keys = ["generation", "dataset"] + (["system", "element"] if suffix == "elements" and "system" in df else ["system"] if suffix == "summary" else ["element"])
+            if df.duplicated(keys).any():
+                raise RuntimeError(f"Duplicate historical {suffix} rows")
+        else:
+            df = pd.DataFrame(columns=columns)
+        df["round_number"] = pd.to_numeric(df["generation"].str.removeprefix("v"), errors="raise") if not df.empty else pd.Series(dtype=int)
+        df = df.sort_values(["round_number"] + (["system", "element"] if suffix == "elements" and "system" in df else ["system"] if suffix == "summary" else ["element"] if suffix == "elements" else []))
+        df = df.drop(columns="round_number")
+        path = cfg.CONVERGENCE_DIR / f"historical_{suffix}.csv"
+        df.to_csv(path, index=False)
+        return path
+
+    summary_path = save_history(summary_rows, "summary", ["generation", "dataset", "system", "frames"])
+    elements_path = save_history(element_rows, "elements", ["generation", "dataset", "element", "atoms"])
+    return summary_path, elements_path
+
+
 def main() -> None:
     cfg.validate_config()
     require_file(cfg.EVALUATION_SUMMARY)
@@ -182,6 +226,7 @@ def main() -> None:
     rec, rz = decide_recommendation(ev, pr)
 
     cfg.CONVERGENCE_DIR.mkdir(parents=True, exist_ok=True)
+    historical_summary, historical_elements = write_historical_errors(summary)
     with cfg.CONVERGENCE_JSON.open("w", encoding="utf-8") as handle:
         json.dump({
             "round": cfg.ROUND,
@@ -200,6 +245,8 @@ def main() -> None:
         f"Independent test guardrail: {bool_text(ev['independent_test']['force_guardrail_pass'])}",
         f"Holdout guardrail: {bool_text(ev['historical_holdout_guardrail_pass'])}",
         f"Enrichment learning: {bool_text(ev['current_enrichment']['learning_pass'])}",
+        f"Historical E/F by system: {historical_summary}",
+        f"Historical force errors by element: {historical_elements}",
     ]
     cfg.CONVERGENCE_REPORT.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"REPORT SAVED: {cfg.CONVERGENCE_JSON}")

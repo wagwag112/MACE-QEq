@@ -43,9 +43,9 @@ PME_ORDER = 6
 REQUESTED_RC = 6.0
 RC_SAFETY = 0.499
 TOL = 1.0e-4
-MAXITER = 1000
+MAXITER = 100
 PME_POINTS_PER_ANG = 1.2
-PME_GRID_BLOCK = 8
+PME_GRID_BLOCK = 4
 PME_GRID_MIN = 16
 PAIR_CAPACITY_FACTOR = 1.15
 MAX_PAIRS = 0
@@ -288,6 +288,9 @@ class QEqSolverFast:
         solve_s = time.perf_counter() - t0
         charges = np.asarray(q_opt, dtype=np.float64)
         iterations = int(result.state.iter_num)
+        convergence_error = float(np.asarray(result.state.error))
+        if not np.isfinite(convergence_error):
+            raise RuntimeError("Non-finite QEq convergence error.")
         if not np.all(np.isfinite(charges)):
             raise RuntimeError("Non-finite optimized charges.")
         t0 = time.perf_counter()
@@ -309,6 +312,7 @@ class QEqSolverFast:
             "charges": charges,
             "charge_error": charge_error,
             "iterations": iterations,
+            "convergence_error": convergence_error,
             "n_pairs": int(n_real),
             "pair_capacity": int(self.nbl.capacity),
             "rc": self.rc,
@@ -358,7 +362,7 @@ def get_system(atoms):
             for el in other_elements:
                 other_bonds |= (is_metal[pair_i] & (sym_arr[pair_j] == el) & (d <= cutoffs[el]))
             cn_other = np.bincount(pair_i[other_bonds], minlength=natoms)
-            is_cand = is_metal & (cn_other == 0)
+            is_cand = is_metal & (cn_other <= 1)
             if np.sum(is_cand) >= min_cluster:
                 metal_bonds = is_cand[pair_i] & is_cand[pair_j] & (d <= r_metal)
                 adj = csr_matrix((np.ones(np.sum(metal_bonds), dtype=bool), (pair_i[metal_bonds], pair_j[metal_bonds])), shape=(natoms, natoms))

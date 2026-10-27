@@ -62,7 +62,7 @@ def validate_inputs(scores, frames):
         raise RuntimeError("Corrupted score file detected.")
 
 def select_high_uncertainty(scores, excluded_frames):
-    ranked = scores[~scores["frame"].isin(excluded_frames)].sort_values("sigma_F_p95_eV_A", ascending=False)
+    ranked = scores[~scores["frame"].isin(excluded_frames)].sort_values(["sigma_F_p95_eV_A", "frame"], ascending=[False, True])
     selected, selected_times = [], []
     for _, row in ranked.iterrows():
         frame = int(row["frame"])
@@ -80,7 +80,7 @@ def select_high_uncertainty(scores, excluded_frames):
 
 def best_available_in_window(scores, start_ps, end_ps, excluded_frames, selected_times):
     subset = scores[(scores["time_ps"] >= start_ps) & (scores["time_ps"] <= end_ps) & (~scores["frame"].isin(excluded_frames))].copy()
-    subset = subset.sort_values("sigma_F_p95_eV_A", ascending=False)
+    subset = subset.sort_values(["sigma_F_p95_eV_A", "frame"], ascending=[False, True])
     for _, row in subset.iterrows():
         if far_enough(float(row["time_ps"]), selected_times, COVERAGE_MIN_SPACING_PS):
             return row.copy()
@@ -104,7 +104,7 @@ def select_holdout(scores, excluded_frames, enrichment_rows):
     holdout_times = []
     for start_ps, end_ps in HOLDOUT_WINDOWS:
         subset = scores[(scores["time_ps"] >= start_ps) & (scores["time_ps"] <= end_ps) & (~scores["frame"].isin(excluded_frames))].copy()
-        subset = subset.sort_values("sigma_F_p95_eV_A", ascending=False)
+        subset = subset.sort_values(["sigma_F_p95_eV_A", "frame"], ascending=[False, True])
         chosen = None
         for _, row in subset.iterrows():
             t = float(row["time_ps"])

@@ -101,7 +101,7 @@ def get_system(atoms):
             for el in other_elements:
                 other_bonds |= (is_metal[pair_i] & (sym_arr[pair_j] == el) & (d <= cutoffs[el]))
             cn_other = np.bincount(pair_i[other_bonds], minlength=natoms)
-            is_cand = is_metal & (cn_other == 0)
+            is_cand = is_metal & (cn_other <= 1)
             if np.sum(is_cand) >= min_cluster:
                 metal_bonds = is_cand[pair_i] & is_cand[pair_j] & (d <= r_metal)
                 adj = csr_matrix((np.ones(np.sum(metal_bonds), dtype=bool), (pair_i[metal_bonds], pair_j[metal_bonds])), shape=(natoms, natoms))
@@ -188,6 +188,8 @@ def align_datasets(dft_frames, short_frames, label):
             raise RuntimeError(f"{label}/{source}: position mismatch.")
         if not np.allclose(dft_atoms.cell.array, short_atoms.cell.array, rtol=0.0, atol=CELL_TOL):
             raise RuntimeError(f"{label}/{source}: cell mismatch.")
+        if not np.array_equal(np.asarray(dft_atoms.pbc, dtype=bool), np.asarray(short_atoms.pbc, dtype=bool)):
+            raise RuntimeError(f"{label}/{source}: PBC mismatch.")
         dft_aligned.append(dft_atoms)
         short_aligned.append(short_atoms)
     return dft_aligned, short_aligned
@@ -213,26 +215,31 @@ def discover_datasets():
     if p_round >= 0:
         round_train_dft = getattr(cfg, "ROUND_TRAIN_DFT", None)
         round_train_short = getattr(cfg, "ROUND_TRAIN_SHORT", None)
-        if round_train_dft and round_train_short:
-            require_file(round_train_dft)
-            require_file(round_train_short)
-            datasets.append({
-                "name": f"v{c_round}_enrichment",
-                "dft": round_train_dft,
-                "short": round_train_short,
-            })
+        if not round_train_dft or not round_train_short:
+            raise RuntimeError(
+                f"v{c_round}: ROUND_TRAIN_DFT and ROUND_TRAIN_SHORT are required."
+            )
+        require_file(round_train_dft)
+        require_file(round_train_short)
+        datasets.append({
+            "name": f"v{c_round}_enrichment",
+            "dft": round_train_dft,
+            "short": round_train_short,
+        })
         for generation in range(START_HOLDOUT_GEN, c_round + 1):
             md_root = getattr(cfg, "MD_ROOT", None)
-            if md_root:
-                base = md_root / f"v{generation}"
-                dft = base / f"v{generation}_holdout_dft.extxyz"
-                short = base / f"v{generation}_holdout_short.extxyz"
-                if dft.is_file() and short.is_file() and dft.stat().st_size > 0 and short.stat().st_size > 0:
-                    datasets.append({
-                        "name": f"v{generation}_holdout",
-                        "dft": dft,
-                        "short": short,
-                    })
+            if md_root is None:
+                raise RuntimeError("MD_ROOT is required for historical holdout evaluation.")
+            base = md_root / f"v{generation}"
+            dft = base / f"v{generation}_holdout_dft.extxyz"
+            short = base / f"v{generation}_holdout_short.extxyz"
+            require_file(dft)
+            require_file(short)
+            datasets.append({
+                "name": f"v{generation}_holdout",
+                "dft": dft,
+                "short": short,
+            })
     else:
         out_valid_dft = getattr(cfg, "OUT_VALID_DFT", None)
         out_valid_short = getattr(cfg, "OUT_VALID_SHORT", None)
@@ -330,13 +337,17 @@ def build_summary_row(
         "frames": len(indices),
         "E_RMSE_full_meV_atom": 1000.0 * rmse(e_ref_pa, e_full_pa),
         "E_RMSE_shortQEq_meV_atom": 1000.0 * rmse(e_ref_pa, e_total_pa),
+        "E_MAE_full_meV_atom": 1000.0 * mae(e_ref_pa, e_full_pa),
+        "E_MAE_shortQEq_meV_atom": 1000.0 * mae(e_ref_pa, e_total_pa),
         "F_RMSE_full_eV_A": rmse(f_ref, f_full),
         "F_RMSE_shortQEq_eV_A": rmse(f_ref, f_total),
+        "F_MAE_full_eV_A": mae(f_ref, f_full),
+        "F_MAE_shortQEq_eV_A": mae(f_ref, f_total),
         "F_maxerr_full_eV_A": full_max,
         "F_maxerr_shortQEq_eV_A": total_max,
     }
 
-def element_rows(generation, dataset_name, dft_frames, dft_forces, full_forces, total_forces):
+def element_rows(generation, dataset_name, system, dft_frames, dft_forces, full_forces, total_forces):
     rows = []
     elements = sorted({s for atoms in dft_frames for s in atoms.get_chemical_symbols()})
     for element in elements:
@@ -365,6 +376,7 @@ def element_rows(generation, dataset_name, dft_frames, dft_forces, full_forces, 
         rows.append({
             "generation": f"v{generation}",
             "dataset": dataset_name,
+            "system": system,
             "element": element,
             "atoms": natoms_element,
             "F_RMSE_full_eV_A": rmse(ref_components, full_components),
@@ -394,6 +406,21 @@ def evaluate_dataset(generation, dataset_name, dft_path, short_path, calc_full, 
     qeq_energy = np.asarray([get_qeq_energy(a) for a in short_frames], dtype=np.float64)
     qeq_forces = [get_qeq_forces(a) for a in short_frames]
 
+    for name, values in (
+        ("DFT energy", dft_energy),
+        ("Short energy", short_energy),
+        ("QEq energy", qeq_energy),
+    ):
+        if not np.all(np.isfinite(values)):
+            raise RuntimeError(f"{dataset_name}: non-finite {name}.")
+    for name, values in (
+        ("DFT forces", dft_forces),
+        ("Short forces", short_forces),
+        ("QEq forces", qeq_forces),
+    ):
+        if any(not np.all(np.isfinite(f)) for f in values):
+            raise RuntimeError(f"{dataset_name}: non-finite {name}.")
+
     reconstructed_energy = short_energy + qeq_energy
     reconstructed_forces = [fs + fq for fs, fq in zip(short_forces, qeq_forces)]
     decomp_e = 1000.0 * rmse(reconstructed_energy / natoms, dft_energy / natoms)
@@ -403,6 +430,19 @@ def evaluate_dataset(generation, dataset_name, dft_path, short_path, calc_full, 
 
     full_energy, full_forces = predict(dft_frames, calc_full)
     pred_short_energy, pred_short_forces = predict(short_frames, calc_short)
+    for name, values in (
+        ("Full prediction energy", full_energy),
+        ("Short prediction energy", pred_short_energy),
+    ):
+        if not np.all(np.isfinite(values)):
+            raise RuntimeError(f"{dataset_name}: non-finite {name}.")
+    for name, values in (
+        ("Full prediction forces", full_forces),
+        ("Short prediction forces", pred_short_forces),
+    ):
+        if any(not np.all(np.isfinite(f)) for f in values):
+            raise RuntimeError(f"{dataset_name}: non-finite {name}.")
+
     total_energy = pred_short_energy + qeq_energy
     total_forces = [fm + fq for fm, fq in zip(pred_short_forces, qeq_forces)]
 
@@ -482,7 +522,14 @@ def evaluate_dataset(generation, dataset_name, dft_path, short_path, calc_full, 
             "worst_element": row["worst_element_shortQEq"],
         })
 
-    elements = element_rows(generation, dataset_name, dft_frames, dft_forces, full_forces, total_forces)
+    elements = element_rows(generation, dataset_name, "ALL", dft_frames, dft_forces, full_forces, total_forces)
+    for sys_name in sorted(set(systems)):
+        idx = [i for i, name in enumerate(systems) if name == sys_name]
+        elements.extend(element_rows(
+            generation, dataset_name, sys_name,
+            [dft_frames[i] for i in idx], [dft_forces[i] for i in idx],
+            [full_forces[i] for i in idx], [total_forces[i] for i in idx],
+        ))
     return summary_rows, frame_rows, elements, worst_rows
 
 def build_change_table(summary):

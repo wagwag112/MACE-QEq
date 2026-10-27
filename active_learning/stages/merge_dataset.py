@@ -124,12 +124,27 @@ def main():
         test_dft, test_short = [], []
         for d_a, s_a in zip(curr_dft, curr_short):
             role = d_a.info.get("al_role")
+            if role != s_a.info.get("al_role"):
+                raise RuntimeError(f"{d_a.info.get('source')}: role mismatch between DFT and Short.")
             if role == "train":
                 train_dft.append(d_a); train_short.append(s_a)
             elif role == "valid":
                 valid_dft.append(d_a); valid_short.append(s_a)
             elif role == "test":
                 test_dft.append(d_a); test_short.append(s_a)
+            else:
+                raise RuntimeError(f"Unexpected al_role '{role}' in {d_a.info.get('source')}")
+        expected = {
+            role: sum(spec["counts"][role] for spec in cfg.V0_SPECS.values())
+            for role in ("train", "valid", "test")
+        }
+        actual = {
+            "train": len(train_dft),
+            "valid": len(valid_dft),
+            "test": len(test_dft),
+        }
+        if actual != expected:
+            raise RuntimeError(f"V0 role count mismatch: actual={actual}, expected={expected}")
         save_atomic_file(OUT_TRAIN_DFT, train_dft)
         save_atomic_file(OUT_TRAIN_SHORT, train_short)
         save_atomic_file(OUT_VALID_DFT, valid_dft)

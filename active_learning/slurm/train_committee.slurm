@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=al_train_committee
+#SBATCH --job-name=train_committee
 #SBATCH --partition=himsa40,requeue-gpu
 #SBATCH --gres=gpu:1
 #SBATCH --nodes=1
@@ -18,8 +18,8 @@ set -eo pipefail
 # PATHS / ENVIRONMENT
 # ============================================================
 
-ROOT="/scratch/tmp/hdang/projects/Li_Li6PS5Cl"
-AL_DIR="${ROOT}/active_learning"
+ROOT="/scratch/tmp/hdang/projects/${ANODE:?ANODE missing}_${SE:?SE missing}"
+AL_DIR="/scratch/tmp/hdang/projects/active_learning"
 
 source "${AL_DIR}/slurm/cluster_config.sh"
 load_gpu_environment
@@ -247,7 +247,7 @@ echo "======================================================================"
     --scheduler_patience=50 \
     --ema \
     --ema_decay=0.99 \
-    --max_num_epochs=120 \
+    --max_num_epochs=100 \
     --patience=2048 \
     --clip_grad=10.0 \
     --default_dtype="float32" \

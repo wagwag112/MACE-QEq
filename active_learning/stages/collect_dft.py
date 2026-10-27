@@ -271,9 +271,9 @@ def sort_key(atoms):
 def validate_role_counts(frames):
     roles = Counter(atoms.info.get("al_role", "") for atoms in frames)
     if cfg.ROUND == 0:
-        exp_train = sum(p["n_train"] for p in cfg.V0_SPECS["tv"].values())
-        exp_valid = sum(p["n_valid"] for p in cfg.V0_SPECS["tv"].values())
-        exp_test = sum(p["n_frames"] for p in cfg.V0_SPECS["test"].values())
+        exp_train = sum(spec["counts"]["train"] for spec in cfg.V0_SPECS.values())
+        exp_valid = sum(spec["counts"]["valid"] for spec in cfg.V0_SPECS.values())
+        exp_test = sum(spec["counts"]["test"] for spec in cfg.V0_SPECS.values())
         train_count = roles.get("train", 0)
         valid_count = roles.get("valid", 0)
         test_count = roles.get("test", 0)

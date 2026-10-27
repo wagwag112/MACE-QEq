@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=al_convergence
+#SBATCH --job-name=convergence
 #SBATCH --partition=express,normal,long
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -11,8 +11,8 @@
 
 set -euo pipefail
 
-ROOT="/scratch/tmp/hdang/projects/Li_Li6PS5Cl"
-AL_DIR="${ROOT}/active_learning"
+ROOT="/scratch/tmp/hdang/projects/${ANODE:?ANODE missing}_${SE:?SE missing}"
+AL_DIR="/scratch/tmp/hdang/projects/active_learning"
 
 cd "$AL_DIR"
 

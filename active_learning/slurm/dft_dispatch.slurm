@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=al_dft_mgr
+#SBATCH --job-name=dft_mgr
 #SBATCH --partition=normal,long
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -11,8 +11,8 @@
 
 set -euo pipefail
 
-ROOT="/scratch/tmp/hdang/projects/Li_Li6PS5Cl"
-AL_DIR="${ROOT}/active_learning"
+ROOT="/scratch/tmp/hdang/projects/${ANODE:?ANODE missing}_${SE:?SE missing}"
+AL_DIR="/scratch/tmp/hdang/projects/active_learning"
 
 source "${AL_DIR}/slurm/cluster_config.sh"
 load_cpu_environment

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=al_score
+#SBATCH --job-name=score
 #SBATCH --partition=himsa40,requeue-gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -10,8 +10,8 @@
 
 set -eo pipefail
 
-ROOT="/scratch/tmp/hdang/projects/Li_Li6PS5Cl"
-AL_DIR="${ROOT}/active_learning"
+ROOT="/scratch/tmp/hdang/projects/${ANODE:?ANODE missing}_${SE:?SE missing}"
+AL_DIR="/scratch/tmp/hdang/projects/active_learning"
 
 source "${AL_DIR}/slurm/cluster_config.sh"
 load_gpu_environment
@@ -31,7 +31,7 @@ print(al_config.ROUND)
 PY
 )
 
-ROOT="/scratch/tmp/hdang/projects/Li_Li6PS5Cl"
+ROOT="/scratch/tmp/hdang/projects/${ANODE:?ANODE missing}_${SE:?SE missing}"
 LOG_DIR="${AL_DIR}/logs/v${ROUND}/committee_scoring"
 mkdir -p "$LOG_DIR"
 

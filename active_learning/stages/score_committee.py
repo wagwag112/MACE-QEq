@@ -68,7 +68,7 @@ def apply_cli_overrides(args):
         SCORING_DIR = args.output_dir.resolve()
         SCORING_FIGURE_DIR = SCORING_DIR / "figures"
         SCORE_FILE = SCORING_DIR / "committee_scores.csv"
-        TOP_UNCERTAINTY_FILE = SCORING_DIR / "top50_uncertainty.csv"
+        TOP_UNCERTAINTY_FILE = SCORING_DIR / "top_uncertainty.csv"
     if args.committee_version is not None:
         v = args.committee_version
         BASE_COMMITTEE_MODEL = TRAINED_MODELS_ROOT / f"train_short_v{v}" / "checkpoints" / f"MACE_short_v{v}_run-{BASE_SEED}.model"
