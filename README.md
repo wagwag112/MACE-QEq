@@ -388,7 +388,7 @@ System-specific methodological parameters are defined exclusively in `al_config.
 | `BOTTOM_EXTERNAL_CHI` | 6.0 eV | Electronegativity shift of the bottom electrode |
 | `UPPER_EXTERNAL_CHI` | −2.0 eV | Electronegativity shift of the upper electrode |
 | `MD_PS` | 50.0 ps | Probe trajectory length |
-| `CN_CADENCE` | 10 steps | Topological neighbor-list and graph-percolation update interval |
+| `CN_CADENCE` | 9 steps | Topological neighbor-list and graph-percolation update interval |
 | `QEQ_UPDATE_EVERY` | 3 steps | QEq charge-minimization update interval |
 | `TIMESTEP_FS` | 2.0 fs | MD time step |
 | `N_HIGH` | 65 | High-uncertainty candidates per round |
