@@ -371,7 +371,7 @@ def sample_v0_complete():
     if not cal_root.is_dir():
         return False
     poscars = list(cal_root.rglob("POSCAR"))
-    target = getattr(cfg, "V0_TARGET_COUNT", 400)
+    target = cfg.V0_TARGET_COUNT
     manifest = getattr(cfg, "V0_BOOTSTRAP_DIR", cfg.MD_ROOT / "v0_bootstrap") / "v0_selection_manifest.csv"
     return len(poscars) == target and file_ok(manifest)
 
@@ -415,7 +415,7 @@ def dft_complete():
 
         return False
 
-    expected_count = getattr(cfg, "V0_TARGET_COUNT", 400) if cfg.ROUND == 0 else cfg.N_SELECTED
+    expected_count = cfg.V0_TARGET_COUNT if cfg.ROUND == 0 else cfg.N_SELECTED
     if len(xml_files) != expected_count:
         return False
 
@@ -601,7 +601,7 @@ def stage_output_status(
         if cfg.ROUND != 0 or main_models_complete():
             return ("DONE", "Bootstrap baseline generation complete.")
         if sample_v0_complete():
-            return ("DONE", f"Bootstrap 400 structures generated.")
+            return ("DONE", f"Bootstrap {cfg.V0_TARGET_COUNT} structures generated.")
         return ("PENDING", "Bootstrap sampling incomplete.")
 
     if cfg.ROUND == 0 and stage in {"committee_scoring", "candidate_selection"}:
