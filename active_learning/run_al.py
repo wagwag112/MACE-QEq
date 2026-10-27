@@ -52,16 +52,8 @@ import al_config as cfg
 import importlib
 
 def sync_config_round(target_round: int) -> None:
-    parent_round = -1 if target_round == 0 else target_round - 1
-    cfg_path = AL_DIR / "al_config.py"
-    content = cfg_path.read_text(encoding="utf-8")
-
-    new_content = re.sub(r"^ROUND\s*=.*", f"ROUND = {target_round}", content, flags=re.MULTILINE)
-    new_content = re.sub(r"^PARENT_ROUND\s*=.*", f"PARENT_ROUND = {parent_round}", new_content, flags=re.MULTILINE)
-
-    if new_content != content:
-        cfg_path.write_text(new_content, encoding="utf-8")
-
+    import os
+    os.environ["AL_ROUND"] = str(target_round)
     importlib.reload(cfg)
     global STATE_FILE, JOB_FILE
     STATE_FILE = STATE_DIR / f"round_v{cfg.ROUND}.json"
@@ -99,13 +91,13 @@ def detect_current_round() -> int:
 AL_DIR = Path(__file__).resolve().parent
 
 STATE_DIR = (
-    AL_DIR
-    / "state"
+    cfg.PROJECT_ROOT
+    / "active_learning_state"
 )
 
 LOG_ROOT = (
-    AL_DIR
-    / "logs"
+    cfg.PROJECT_ROOT
+    / "active_learning_logs"
 )
 
 STATE_FILE = (
@@ -141,6 +133,12 @@ STAGES = [
 SLURM_SCRIPTS = {
     "sample_v0":
         "slurm/sample_v0.slurm",
+
+    "sample_v0_bulk":
+        "slurm/sample_v0_bulk.slurm",
+
+    "sample_v0_finalize":
+        "slurm/sample_v0_finalize.slurm",
 
     "committee_scoring":
         "slurm/committee_scoring.slurm",
@@ -632,7 +630,7 @@ def stage_output_status(
                 cfg.SCORING_DIR.mkdir(parents=True, exist_ok=True)
                 cfg.SCORING_FIGURE_DIR.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(prev_score, cfg.SCORE_FILE)
-                prev_top50 = prev_scoring_dir / "top50_uncertainty.csv"
+                prev_top50 = prev_scoring_dir / "top_uncertainty.csv"
                 if file_ok(prev_top50):
                     shutil.copy2(prev_top50, cfg.TOP_UNCERTAINTY_FILE)
                 prev_fig = prev_scoring_dir / "figures" / "sigma_p95_vs_time.png"
@@ -1218,23 +1216,29 @@ def submit_slurm(
         print(f"{stage}: reusing job {existing}")
         return existing
     elif existing is not None:
-        subprocess.run(["scancel", str(existing)], capture_output=True)
+        raise RuntimeError(
+            f"{stage}: active job {existing} has a different dependency; refusing automatic cancellation"
+        )
 
     command = [
         "sbatch",
         "--parsable",
     ]
 
+    log_dir = cfg.PROJECT_ROOT / "active_learning_logs" / f"v{cfg.ROUND}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    command.append(f"--output={log_dir / (stage + '_%A_%a.out')}")
+    command.append(f"--error={log_dir / (stage + '_%A_%a.err')}")
+
     if dependency is not None:
         deps = [str(d).strip() for d in (dependency if isinstance(dependency, (list, tuple)) else re.split(r"[:,]", str(dependency))) if str(d).strip()]
         dep_clause = ",".join(f"afterok:{d}" for d in deps)
         command.append(f"--dependency={dep_clause}")
 
+    export_vars = f"ALL,AL_ROUND={cfg.ROUND},ANODE={cfg.ANODE},SE={cfg.SE}"
     if stage in CPU_STAGES:
-
-        command.append(
-            f"--export=ALL,AL_STAGE={stage}"
-        )
+        export_vars += f",AL_STAGE={stage}"
+    command.append(f"--export={export_vars}")
 
     if stage == "train_committee":
 
@@ -1787,26 +1791,39 @@ def run_round():
     # v0 Bootstrap Branch (sample_v0 -> dft -> post_dft_chain)
     # ------------------------------------------------------------------
     if cfg.ROUND == 0:
-        sample_job = None
+        sample_dependency = None
+
         if sample_v0_complete():
-            print("sample_v0: already complete (400 structures generated)")
+            print(f"sample_v0: already complete ({cfg.V0_TARGET_COUNT} structures)")
         else:
-            sample_job = reusable_job("sample_v0")
-            if sample_job is None:
-                sample_job = submit_slurm("sample_v0")
-                print(f"Submitted sample_v0: {sample_job}")
-            else:
-                print(f"sample_v0: using active job {sample_job}")
+            from stages.sample_v0 import get_task_specs, task_output_complete
+
+            tasks = get_task_specs()
+            if len(tasks) != 9:
+                raise RuntimeError(f"Expected 9 V0 tasks, found {len(tasks)}")
+
+            gpu_complete = all(task_output_complete(tasks[i]) for i in range(3))
+            bulk_complete = all(task_output_complete(tasks[i]) for i in range(3, 9))
+
+            pending_jobs = []
+            if not gpu_complete:
+                pending_jobs.append(submit_slurm("sample_v0"))
+            if not bulk_complete:
+                pending_jobs.append(submit_slurm("sample_v0_bulk"))
+
+            sample_dependency = submit_slurm(
+                "sample_v0_finalize",
+                dependency=pending_jobs if pending_jobs else None,
+            )
+            print(
+                f"sample_v0: GPU complete={gpu_complete}, "
+                f"CPU complete={bulk_complete}, finalize={sample_dependency}"
+            )
 
         dft_job = None
         if not dft_complete():
-            dft_job = reusable_job("dft")
-            if dft_job is None:
-                dft_dependency = sample_job
-                dft_job = submit_slurm("dft", dependency=dft_dependency)
-                print(f"Submitted automated DFT dispatcher: {dft_job} (dependency: {dft_dependency})")
-            else:
-                print(f"dft: using active dispatcher job {dft_job}")
+            dft_job = submit_slurm("dft", dependency=sample_dependency)
+            print(f"DFT dispatcher: {dft_job} (dependency: {sample_dependency})")
         else:
             print("dft: calculations already complete")
 

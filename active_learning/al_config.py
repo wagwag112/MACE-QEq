@@ -1,14 +1,15 @@
+import os
 from pathlib import Path
 
-ROOT = Path("/scratch/tmp/hdang/projects/Li_Li6PS5Cl")
-PROJECT_ROOT = ROOT
-
-ROUND = 1
-PARENT_ROUND = 0
-ANODE = "Li"
-SE = "Li6PS5Cl"
+PROJECTS_DIR = Path("/scratch/tmp/hdang/projects")
+ANODE = os.environ.get("ANODE", "Li")
+SE = os.environ.get("SE", "Li6PS5Cl")
 SYSTEM = f"{ANODE}_{SE}"
+PROJECT_ROOT = PROJECTS_DIR / SYSTEM
+ROOT = PROJECT_ROOT
 
+ROUND = int(os.environ.get("AL_ROUND", "0"))
+PARENT_ROUND = -1 if ROUND == 0 else ROUND - 1
 ACTIVE_METAL = ANODE
 RCUT_METAL = 3.50
 MIN_CLUSTER_SIZE = 8
@@ -36,10 +37,10 @@ TEMPERATURE_K = 300
 MD_PS = 50
 TIMESTEP_FS = 2.0
 SAVE_EVERY = 10
-MD_SEED = 20261004
+MD_SEED = 0
 TTIME_FS = 20.0
 
-PAIR_CAPACITY_FACTOR = 1.2
+PAIR_CAPACITY_FACTOR = 1.15
 MAX_PAIRS = 0
 DEVICE = "cuda"
 
@@ -53,7 +54,7 @@ N_SELECTED = N_ENRICH + N_HOLDOUT
 HIGH_MIN_SPACING_PS = round(MD_PS / 140.0, 3)
 MIN_HOLDOUT_DISTANCE_PS = round(MD_PS / 500.0, 3)
 COVERAGE_MIN_SPACING_PS = round(MD_PS / 1500.0, 3)
-EXPECTED_VALID = 100
+EXPECTED_VALID = 70
 
 PROBE_MD_PS = 50
 PROBE_TEMPERATURE_K = 300
@@ -62,14 +63,14 @@ PROBE_BOTTOM_EXTERNAL_CHI = BOTTOM_EXTERNAL_CHI
 PROBE_UPPER_EXTERNAL_CHI = UPPER_EXTERNAL_CHI
 PROBE_MD_SEED = MD_SEED + 1000 + ROUND
 
-CONV_SIGMA_P95_TARGET = 0.100
-CONV_SIGMA_P95_HARD = 0.150
+CONV_SIGMA_P95_TARGET = 0.075
+CONV_SIGMA_P95_HARD = 0.100
 CONV_MAX_FRAC_EXCEED_TARGET = 0.01
 CONV_MAX_FRAC_EXCEED_HARD = 0.00
 CONV_MAX_TEST_FORCE_RMSE_REGRESSION = 0.10
 CONV_MAX_HOLDOUT_FORCE_RMSE_REGRESSION = 0.20
 
-COMMITTEE_SEEDS = [20261004, 20261005, 20261006, 20261007]
+COMMITTEE_SEEDS = [1, 2, 3, 4]
 BASE_SEED = COMMITTEE_SEEDS[0]
 
 COVERAGE_WINDOWS = [
@@ -90,13 +91,13 @@ PROBE_EXPECTED_MD_FRAMES = PROBE_TOTAL_MD_STEPS // SAVE_EVERY + 1
 
 MD_ROOT = ROOT / "md_validation"
 DATA_DIR = ROOT / "data"
-ACTIVE_LEARNING_DIR = ROOT / "active_learning"
+ACTIVE_LEARNING_DIR = PROJECTS_DIR / "active_learning"
 
 
 
 
-CONSTQ_INPUT_STRUCTURE = PROJECT_ROOT / "structures" / f"{SYSTEM}_test.vasp"
-CONSTP_INPUT_STRUCTURE = PROJECT_ROOT / "structures" / f"{SYSTEM}_tv.vasp"
+CONSTQ_INPUT_STRUCTURE = PROJECT_ROOT / "structures" / f"{SYSTEM}_train.vasp"
+CONSTP_INPUT_STRUCTURE = PROJECT_ROOT / "structures" / f"{SYSTEM}_train.vasp"
 INPUT_STRUCTURE = CONSTP_INPUT_STRUCTURE if EXPLORATION_MODE == "constp" else CONSTQ_INPUT_STRUCTURE
 PROBE_INPUT_STRUCTURE = CONSTP_INPUT_STRUCTURE if PROBE_MODE == "constp" else CONSTQ_INPUT_STRUCTURE
 
@@ -112,20 +113,37 @@ PRETRAINED_MACE_MODEL = TRAINED_MODELS_ROOT / "mace-mpa-0-medium.model"
 V0_BOOTSTRAP_DIR = MD_ROOT / "v0_bootstrap"
 V0_TRAJ_DIR = V0_BOOTSTRAP_DIR / "trajectories"
 V0_SAMPLED_DIR = V0_BOOTSTRAP_DIR / "sampled_extxyz"
-V0_TARGET_COUNT = 400
-
-V0_SPECS = {
-    "test": {
-        ANODE: {"n_frames": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{ANODE}_test.vasp"},
-        SE: {"n_frames": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{SE}_test.vasp"},
-        SYSTEM: {"n_frames": 80, "dt_ps": 0.5, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{SYSTEM}_test.vasp"},
-    },
-    "tv": {
-        ANODE: {"n_train": 50, "n_valid": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{ANODE}_tv.vasp"},
-        SE: {"n_train": 50, "n_valid": 10, "dt_ps": 1.0, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{SE}_tv.vasp"},
-        SYSTEM: {"n_train": 100, "n_valid": 80, "dt_ps": 0.5, "t_equil_ps": 2.0, "struct": PROJECT_ROOT / "structures" / f"{SYSTEM}_tv.vasp"},
-    },
+# V0 roles: each split uses an independent source and random stream.
+V0_ROLES = ("train", "valid", "test")
+V0_COUNTS = {
+    ANODE: {"train": 50, "valid": 10, "test": 10},
+    SE: {"train": 50, "valid": 10, "test": 10},
+    SYSTEM: {"train": 100, "valid": 50, "test": 50},
 }
+V0_SPECS = {
+    name: {
+        "method": "md" if name == SYSTEM else "bulk",
+        "struct": {role: PROJECT_ROOT / "structures" / f"{name}_{role}.vasp" for role in V0_ROLES},
+        "counts": counts,
+    }
+    for name, counts in V0_COUNTS.items()
+}
+V0_TARGET_COUNT = sum(sum(counts.values()) for counts in V0_COUNTS.values())
+# V0 MD: smaller interval raises temporal correlation; longer equilibration increases cost.
+V0_MD_DT_PS = 0.5
+V0_MD_EQUIL_PS = 2.0
+V0_MD_TIMESTEP_FS = 1.0
+V0_MD_SAVE_EVERY = 10
+# V0 seeds: independent system/role streams; changing them changes generated structures.
+V0_SEED = BASE_SEED
+# V0 bulk: counts per method are distributed deterministically within each role.
+V0_BULK_METHODS = ("displacement", "strain", "rattle")
+# Displacement (A): one randomly selected Li atom per structure; larger values shorten some pairs.
+V0_DISPLACEMENT_A = (0.15, 0.50, 1.00, 1.50)
+# Strain: isotropic cell scale; below 1 compresses, above 1 expands.
+V0_STRAIN_SCALE = (0.75, 0.85, 0.95, 1.00, 1.02, 1.04)
+# Rattle (A): Cartesian Gaussian standard deviation; larger values increase disorder.
+V0_RATTLE_STDEV_A = (0.05, 0.10, 0.20, 0.35)
 
 if ROUND == 0:
     CURRENT_FULL_MODEL = PRETRAINED_MACE_MODEL
@@ -155,7 +173,7 @@ SELECTION_TRAJECTORY_FILE = PREV_PROBE_TRAJ if (PARENT_ROUND is not None and PAR
 
 SELECTION_SCORE_FILE = SCORING_DIR / "committee_scores.csv"
 SCORE_FILE = SCORING_DIR / "committee_scores.csv"
-TOP_UNCERTAINTY_FILE = SCORING_DIR / "top50_uncertainty.csv"
+TOP_UNCERTAINTY_FILE = SCORING_DIR / "top_uncertainty.csv"
 SCORING_FIGURE_DIR = SCORING_DIR / "figures"
 SELECTION_MANIFEST = FRAMES_DIR / "selection_manifest.csv"
 DFT_SELECTED_DIR = ROUND_DIR / "dft_selected"
@@ -203,7 +221,7 @@ PROBE_TRAJECTORY_ASE_FILE = PROBE_OUTPUT_DIR / "md.traj"
 PROBE_THERMO_FILE = PROBE_OUTPUT_DIR / "thermo.csv"
 
 PROBE_SCORE_FILE = FRESH_PROBE_SCORING_DIR / "committee_scores.csv"
-PROBE_TOP_UNCERTAINTY_FILE = FRESH_PROBE_SCORING_DIR / "top50_uncertainty.csv"
+PROBE_TOP_UNCERTAINTY_FILE = FRESH_PROBE_SCORING_DIR / "top_uncertainty.csv"
 PROBE_SCORING_FIGURE_DIR = FRESH_PROBE_SCORING_DIR / "figures"
 
 CONVERGENCE_REPORT = CONVERGENCE_DIR / "convergence_report.txt"
@@ -214,7 +232,7 @@ def validate_config():
     if ROUND == 0:
         if PARENT_ROUND is not None and PARENT_ROUND != -1:
             raise RuntimeError("PARENT_ROUND must be None or -1 for ROUND 0.")
-        total_v0 = sum(p["n_frames"] for p in V0_SPECS["test"].values()) + sum(p["n_train"] + p["n_valid"] for p in V0_SPECS["tv"].values())
+        total_v0 = sum(sum(counts.values()) for counts in V0_COUNTS.values())
         if total_v0 != V0_TARGET_COUNT:
             raise RuntimeError(f"V0 target frame mismatch: {total_v0} != {V0_TARGET_COUNT}")
     else:
@@ -275,10 +293,9 @@ DFT_PARTITIONS = [
     "himszen4", "q0heuer"
 ]
 DFT_CPUS_PER_JOB = 24
-DFT_TIME_LIMIT = "24:00:00"
+DFT_TIME_LIMIT = "12:00:00"
 
 DFT_ROOT = ROOT / "DFT"
 DFT_CALC_DIR = DFT_ROOT / f"v{ROUND}" / "cal"
 DFT_TEMPLATE_DIR = ACTIVE_LEARNING_DIR / "template"
 DFT_RUN_SCRIPT = ACTIVE_LEARNING_DIR / "slurm" / "run_dft.sh"
-

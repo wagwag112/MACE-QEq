@@ -151,7 +151,7 @@ Reference labels are single-point VASP calculations [8] (PBE-D3(BJ), plane-wave 
 ```mermaid
 %%{init: {"flowchart": {"wrappingWidth": 340, "nodeSpacing": 40, "rankSpacing": 30}}}%%
 flowchart TD
-    A["Configuration sampling<br/>Round 0: Langevin MD (400 frames)<br/>Round v ≥ 1: candidate selection (65 / 15 / 20)"]
+    A["Configuration sampling<br/>Round 0: 9 inputs → 340 configurations<br/>Round v ≥ 1: candidate selection (65 / 15 / 20)"]
     B["DFT labels and QEq residual<br/>VASP single points; E_short = E_DFT − E_QEq"]
     C["Dataset split and merge<br/>three-way leakage check"]
     D["MACE training<br/>Full · Short · Committee"]
@@ -166,28 +166,26 @@ flowchart TD
     H -- "yes" --> Z
 ```
 
-### 2.1 Bootstrap Sampling and Multi-GPU Execution
+### 2.1 Round-0 Bootstrap: Nine Independent Input Structures
 
-The Round-0 sampler `sample_v0.py` uses multiprocessing with the `spawn` context. The number of independent workers is
+Round 0 uses **nine distinct input structures**: three systems × three independent roles (`train`, `valid`, `test`). Each role reads its own POSCAR file from the system-specific `structures/` directory.
 
-```math
-N_{\mathrm{workers}} = \min(N_{\mathrm{GPUs}}, N_{\mathrm{tasks}})
-```
+| System | Train input | Validation input | Test input | Train frames | Validation frames | Test frames |
+| :--- | :--- | :--- | :--- | ---: | ---: | ---: |
+| Li | `Li_train.vasp` | `Li_valid.vasp` | `Li_test.vasp` | 50 | 10 | 10 |
+| Li6PS5Cl | `Li6PS5Cl_train.vasp` | `Li6PS5Cl_valid.vasp` | `Li6PS5Cl_test.vasp` | 50 | 10 | 10 |
+| Li_Li6PS5Cl | `Li_Li6PS5Cl_train.vasp` | `Li_Li6PS5Cl_valid.vasp` | `Li_Li6PS5Cl_test.vasp` | 100 | 50 | 50 |
+| **Total** | **9 inputs** | | | **200** | **70** | **70** |
 
-For example, `sample_v0.slurm` may request four physical NVIDIA A40 GPUs (`#SBATCH --gres=gpu:4`) for six configured trajectories:
+**Total Round-0 output: 340 labeled configurations**, not 400. The 3 interface tasks use pretrained-model MD sampling; the 6 bulk tasks use deterministic `displacement`, `strain`, and `rattle` perturbations. The interface MD sampler uses a 1 fs step, 2 ps equilibration, 0.5 ps sampled-frame interval, and role-specific random seeds. The bulk sampler cycles over the three perturbation methods and applies configured displacement, strain, and rattle ranges.
 
-| Task | Configuration |
-| :---: | :--- |
-| 0 | `test_Li` |
-| 1 | `test_Li6PS5Cl` |
-| 2 | `test_Li_Li6PS5Cl` |
-| 3 | `tv_Li` |
-| 4 | `tv_Li6PS5Cl` |
-| 5 | `tv_Li_Li6PS5Cl` |
+The nine tasks are distributed by the Slurm array configuration:
 
-The first four tasks are assigned immediately to `cuda:0`–`cuda:3`, so **four MD trajectories run concurrently**. Tasks 4 and 5 remain in the FIFO task queue. When any worker finishes its current trajectory, it automatically dequeues the next task. Therefore, seeing only **4 of 6 `.traj` files initially is expected**: the remaining two files are created as soon as the first workers become available.
+- `slurm/sample_v0.slurm`: array `0-2%3`, **one GPU per array task**, partition `himsa40`; three interface MD tasks.
+- `slurm/sample_v0_bulk.slurm`: array `3-8`, CPU-only, partition `normal`; six bulk sampling tasks.
+- `slurm/sample_v0_finalize.slurm`: finalizes the nine streams into the Round-0 selection manifest.
 
-This queueing behaviour is independent of the total number of configured trajectories. Increasing the GPU allocation increases the number of concurrent workers up to the number of pending tasks.
+**Implementation:** `al_config.py` (`V0_ROLES`, `V0_COUNTS`, `V0_SPECS`, `V0_TARGET_COUNT`), `stages/sample_v0.py` (`get_task_specs`, `generate_bulk_frames`), and the three Slurm scripts above. There is no six-trajectory, four-GPU worker queue in the current implementation.
 
 ### 2.2 Committee Uncertainty
 
@@ -213,7 +211,7 @@ In each round v ≥ 1, exactly 100 configurations are selected from the scored p
 | Uniform coverage | 15 | Highest-uncertainty frame in each of 15 equal windows (3.33 ps) | Δt ≥ 0.033 ps |
 | Independent holdout | 20 | One frame in each of 20 uniform windows; never used for training | Δt ≥ 0.100 ps from all enrichment frames |
 
-The separation constraints suppress thermally correlated neighbours. The holdout frames serve as an out-of-sample benchmark in all subsequent generations. Before merging, the three-way split (training, test, holdout) is verified to be free of data leakage.
+The spacing constraints reduce the selection of temporally adjacent configurations. The holdout frames serve as an out-of-sample benchmark in all subsequent generations. Before merging, the three-way split (training, test, holdout) is verified to be free of data leakage.
 
 ### 2.4 Convergence Criteria
 
@@ -221,43 +219,90 @@ Generation k is declared converged when all of the following criteria are satisf
 
 | # | Criterion | Condition |
 | :---: | :--- | :--- |
-| 1 | Uncertainty target | Fraction of probe frames with σ_F,p95 ≥ 0.100 eV/Å is ≤ 1.0 % |
-| 2 | Uncertainty ceiling | No probe frame with σ_F,p95 ≥ 0.150 eV/Å (0.0 %) |
+| 1 | Uncertainty target | Fraction of probe frames with σ_F,p95 ≥ 0.075 eV/Å is ≤ 1.0 % (source-code default) |
+| 2 | Uncertainty ceiling | No probe frame with σ_F,p95 ≥ 0.100 eV/Å (0.0 %) |
 | 3 | Test-set regression | Force RMSE on the independent test set increases by ≤ 10 % relative to the parent generation |
 | 4 | Holdout preservation | Force RMSE on every historical holdout set increases by ≤ 20 % |
 | 5 | Enrichment learning | Force RMSE of the Short+QEq model on the current enrichment set is strictly lower than that of the parent generation |
 
 Criteria 1 and 2 are evaluated on a fresh 50 ps ConstP probe trajectory.
 
+**Configuration audit:** The supplied `all_files.txt` declares `CONV_MAX_FRAC_EXCEED_TARGET = 0.01` (1%). A previously discussed **2%** target is **not reflected in this uploaded source**. To use 2%, set `CONV_MAX_FRAC_EXCEED_TARGET = 0.02` in the deployed `active_learning/al_config.py` and regenerate the convergence report; this README does not assume that remote edit has occurred.
+
 ---
 
 ## 3. Repository Structure
 
+The shared workflow lives under `projects/active_learning/`, alongside the material-specific input/output directory. `Li_SE/` below is a **schematic placeholder**, not a claim that the legacy filesystem already follows this layout. The `slurm/` and `stages/` file names are taken from the uploaded `all_files.txt` and checked against `tree.txt`.
+
 ```text
-├── al_config.py                    # Single source of truth for system-specific settings
-├── run_al.py                       # Orchestrator (Slurm DAG, idempotent execution)
-├── structures/                     # Supercell POSCAR files (bulk phases, interface)
-├── data/                           # Cumulative training, validation, test sets (extxyz)
-├── trained_models/                 # Checkpoints of Full, Short, and Committee models
-├── md_validation/                  # Per-round trajectories, scoring, and reports
-└── active_learning/
-    ├── slurm/                      # Slurm job templates, one per workflow stage
-    ├── template/                   # DFT input templates (INCAR, KPOINTS, POTCAR)
-    └── stages/                     # Python engines for the workflow stages
-        ├── sample_v0.py            # Bootstrap Langevin sampler
-        ├── run_md.py               # ConstP/ConstQ MD driver, graph-based electrodes
-        ├── build_qeq_residual.py   # JAX PME-QEq solver, residual label generation
-        ├── score_committee.py      # Committee force-uncertainty estimator
-        ├── select_candidates.py    # Quota-based candidate selection (65/15/20)
-        ├── prepare_dft.py          # Structure validation, POSCAR staging
-        ├── dispatch_dft.py         # Self-healing Slurm VASP job manager
-        ├── collect_dft.py          # vasprun.xml parser, geometry verification
-        ├── merge_dataset.py        # Three-way leakage check, dataset merge
-        ├── evaluate_models.py      # Cross-generation accuracy comparison
-        ├── run_fresh_probe.py      # Fresh-probe MD wrapper
-        ├── score_fresh_probe.py    # Fresh-probe trajectory scoring
-        └── convergence_report.py   # Convergence evaluation, JSON report
+projects/
+├── active_learning/
+│   ├── al_config.py
+│   ├── run_al.py
+│   ├── slurm/
+│   │   ├── cluster_config.sh
+│   │   ├── committee_scoring.slurm
+│   │   ├── convergence_report.slurm
+│   │   ├── cpu_stage.slurm
+│   │   ├── dft_dispatch.slurm
+│   │   ├── evaluation.slurm
+│   │   ├── fresh_probe.slurm
+│   │   ├── probe_scoring.slurm
+│   │   ├── qeq_residual.slurm
+│   │   ├── run_dft.sh
+│   │   ├── sample_v0.slurm
+│   │   ├── sample_v0_bulk.slurm
+│   │   ├── sample_v0_finalize.slurm
+│   │   ├── train_committee.slurm
+│   │   └── train_models.slurm
+│   ├── stages/
+│   │   ├── build_qeq_residual.py
+│   │   ├── collect_dft.py
+│   │   ├── convergence_report.py
+│   │   ├── dispatch_dft.py
+│   │   ├── evaluate_models.py
+│   │   ├── merge_dataset.py
+│   │   ├── prepare_dft.py
+│   │   ├── run_fresh_probe.py
+│   │   ├── run_md.py
+│   │   ├── sample_v0.py
+│   │   ├── score_committee.py
+│   │   ├── score_fresh_probe.py
+│   │   └── select_candidates.py
+│   └── template/
+│       ├── Li/
+│       ├── Li6PS5Cl/
+│       └── Li_Li6PS5Cl/
+└── Li_SE/
+    ├── structures/
+    │   ├── [train, valid, and test input structures]
+    │   └── ...
+    ├── data/
+    │   ├── [DFT-labeled datasets]
+    │   └── ...
+    ├── DFT/
+    │   ├── v0/
+    │   ├── v1/
+    │   └── ...
+    ├── trained_models/
+    │   ├── train_short_v0/
+    │   ├── train_full_v0/
+    │   ├── committee_short_v0/
+    │   └── ...
+    ├── md_validation/
+    │   ├── v0_bootstrap/
+    │   ├── active_learning_v0/
+    │   ├── v1/
+    │   ├── active_learning_v1/
+    │   └── ...
+    └── logs/
+        ├── v0/
+        ├── v1/
+        └── ...
 ```
+
+The nine Round-0 POSCAR inputs belong to the actual system-specific `structures/` paths defined in `al_config.py`. `Li_SE/` is only a generic example of the directory organization. The three `sample_v0*.slurm` scripts are distinct launch stages for GPU interface sampling, CPU bulk sampling, and finalization; all invoke the single Python implementation `stages/sample_v0.py`.
 
 ---
 
@@ -294,6 +339,12 @@ bash -c 'source active_learning/slurm/cluster_config.sh && load_gpu_environment'
 
 The workflow is driven by the orchestrator `run_al.py`. It inspects the physical artifacts of each stage, skips completed stages, reuses active Slurm jobs, and chains the remaining stages with `afterok` dependencies.
 
+From the project root, enter the shared workflow directory before using the commands below:
+
+```bash
+cd /scratch/tmp/hdang/projects/active_learning
+```
+
 **Pipeline status** (completed stages, active Slurm jobs, convergence metrics):
 
 ```bash
@@ -327,12 +378,12 @@ python -u stages/build_qeq_residual.py <input_dft.extxyz> \
 
 ## 6. Key Hyperparameters
 
-System-specific methodological parameters are defined exclusively in `al_config.py`. Defaults correspond to the Li | β-Li₃N baseline.
+System-specific methodological parameters are defined exclusively in `al_config.py`. Defaults correspond to `ANODE=Li`, `SE=Li6PS5Cl` (Li | Li6PS5Cl).
 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
 | `RCUT_METAL` | 3.50 Å | Metal–metal cutoff for graph percolation |
-| `SE_ELEMENT_CUTOFFS` | `{"N": 2.50}` Å | Active-metal cutoffs for all elements in X_other |
+| `SE_ELEMENT_CUTOFFS` | `{"N": 2.50, "P": 2.80, "S": 2.90, "Cl": 3.05}` Å | Active-metal cutoffs for all elements in X_other |
 | `MIN_CLUSTER_SIZE` | 8 | Phase-identification threshold in `get_system()`; not used for ConstP bias assignment |
 | `EXPLORATION_MODE` | `"constp"` | MD mode (`"constp"` or `"constq"`) |
 | `BOTTOM_EXTERNAL_CHI` | 6.0 eV | Electronegativity shift of the bottom electrode |
@@ -346,8 +397,11 @@ System-specific methodological parameters are defined exclusively in `al_config.
 | `N_HOLDOUT` | 20 | Independent holdout frames per round |
 | `HIGH_MIN_SPACING_PS` | 0.357 ps | Minimum separation between high-uncertainty frames |
 | `MIN_HOLDOUT_DISTANCE_PS` | 0.100 ps | Minimum separation of holdout from enrichment frames |
-| `CONV_SIGMA_P95_TARGET` | 0.100 eV/Å | Soft uncertainty threshold |
-| `CONV_SIGMA_P95_HARD` | 0.150 eV/Å | Hard uncertainty threshold |
+| `CONV_SIGMA_P95_TARGET` | 0.075 eV/Å | Soft uncertainty threshold |
+| `CONV_SIGMA_P95_HARD` | 0.100 eV/Å | Hard uncertainty threshold |
+| `CONV_MAX_FRAC_EXCEED_TARGET` | 0.01 (1%) | Maximum fraction above target; uploaded-code default |
+| `CONV_MAX_FRAC_EXCEED_HARD` | 0.00 (0%) | Maximum fraction above hard ceiling |
+| `V0_TARGET_COUNT` | 340 | Total Round-0 configurations from nine inputs |
 
 ---
 
@@ -403,3 +457,12 @@ These values are **not universal physical constants**. For every new chemical sy
 ## 9. License
 
 Distributed under the MIT License.
+
+
+---
+
+## Source and Verification Notes
+
+This edition uses `all_files.txt` (the supplied implementation dump) and `tree.txt` (the supplied repository tree) as the authoritative sources for **implemented workflow behavior and paths**. The earlier `README.md` and `README.pdf` are reused only for explanatory text and mathematical background where consistent with the implementation. The exact live state of the remote HPC repository, completed jobs, numerical accuracy, and deployed configuration overrides cannot be established from the supplied static files.
+
+The Round-0 counts, nine input names, sampling methods, and Slurm task allocations were checked against the supplied code. Any scientific convergence statement requires the actual report and benchmark, not this documentation alone.
