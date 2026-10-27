@@ -456,12 +456,3 @@ These values are **not universal physical constants**. For every new chemical sy
 ## 9. License
 
 Distributed under the MIT License.
-
-
----
-
-## Source and Verification Notes
-
-This edition uses `all_files.txt` (the supplied implementation dump) and `tree.txt` (the supplied repository tree) as the authoritative sources for **implemented workflow behavior and paths**. The earlier `README.md` and `README.pdf` are reused only for explanatory text and mathematical background where consistent with the implementation. The exact live state of the remote HPC repository, completed jobs, numerical accuracy, and deployed configuration overrides cannot be established from the supplied static files.
-
-The Round-0 counts, nine input names, sampling methods, and Slurm task allocations were checked against the supplied code. Any scientific convergence statement requires the actual report and benchmark, not this documentation alone.
