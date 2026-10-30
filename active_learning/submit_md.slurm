@@ -27,6 +27,7 @@ RESTART=1
 TEMP_K=300
 TIMESTEP_FS=1.0
 SAVE_EVERY=100
+COLLISION_CHECK_EVERY=100
 SEED=20261013
 DEVICE="cuda"
 
@@ -97,6 +98,7 @@ CMD_ARGS=(
     "--steps=${STEPS}"
     "--timestep-fs=${TIMESTEP_FS}"
     "--save-every=${SAVE_EVERY}"
+    "--collision-check-every=${COLLISION_CHECK_EVERY}"
     "--seed=${SEED}"
     "--device=${DEVICE}"
     "--planes-per-side=${PLANES_PER_SIDE}"
