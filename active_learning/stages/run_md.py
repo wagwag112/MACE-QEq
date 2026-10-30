@@ -523,6 +523,7 @@ def parse_args():
     parser.add_argument("--timestep-fs", type=float, default=DEFAULT_TIMESTEP_FS)
     parser.add_argument("--ttime-fs", type=float, default=DEFAULT_TTIME_FS)
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
+    parser.add_argument("--collision-check-every", type=int, default=0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--planes-per-side", type=int, default=CONSTP_FIXED_PLANES_PER_SIDE)
     parser.add_argument("--plane-tol", type=float, default=CONSTP_FIXED_PLANE_TOL)
@@ -609,6 +610,8 @@ def main():
         raise ValueError("Invalid integration step or time constant.")
     if args.qeq_update_every <= 0:
         raise ValueError("qeq_update_every must be >= 1.")
+    if args.collision_check_every < 0:
+        raise ValueError("collision_check_every must be >= 0.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     traj_file = output_dir / "md.traj"
@@ -981,6 +984,45 @@ def main():
         if args.restart and dyn.get_number_of_steps() == 0:
             return
         save_frame()
+
+    def check_collisions():
+        step = restart_step + dyn.get_number_of_steps()
+        pair_i, pair_j, distances = neighbor_list(
+            "ijd", atoms, 1.5, self_interaction=False
+        )
+
+        unique_pairs = {}
+        for i, j, distance in zip(pair_i, pair_j, distances):
+            i, j = int(i), int(j)
+            if i == j:
+                continue
+            key = (min(i, j), max(i, j))
+            distance = float(distance)
+            if key not in unique_pairs or distance < unique_pairs[key]:
+                unique_pairs[key] = distance
+
+        if not unique_pairs:
+            return
+
+        values = np.fromiter(unique_pairs.values(), dtype=np.float64)
+        n15 = int(np.count_nonzero(values < 1.5))
+        n12 = int(np.count_nonzero(values < 1.2))
+        n10 = int(np.count_nonzero(values < 1.0))
+
+        if n15 >= 10 or n12 >= 5 or n10 >= 1:
+            closest = min(unique_pairs, key=unique_pairs.get)
+            minimum = unique_pairs[closest]
+            raise RuntimeError(
+                f"Collision abort at step {step}: "
+                f"pairs_below_1.5A={n15}, "
+                f"pairs_below_1.2A={n12}, "
+                f"pairs_below_1.0A={n10}, "
+                f"min_distance={minimum:.6f} A, "
+                f"closest_pair={closest}"
+            )
+
+    if args.collision_check_every > 0:
+        dyn.attach(check_collisions, interval=args.collision_check_every)
 
     dyn.attach(scheduled_save, interval=args.save_every)
 
