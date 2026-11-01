@@ -3,7 +3,12 @@
 from ase.io import iread
 from ase.neighborlist import neighbor_list
 
-FILE = "/work/hoang0000/Li_Li3N/md_validation/2/md.extxyz"
+import sys
+
+if len(sys.argv) != 2:
+    raise SystemExit(f"Usage: python {sys.argv[0]} <path.extxyz>")
+
+FILE = sys.argv[1]
 FRAME_DT_PS = 0.01
 CHECK_EVERY_PS = 0.1
 CUTOFF_A = 1.0
