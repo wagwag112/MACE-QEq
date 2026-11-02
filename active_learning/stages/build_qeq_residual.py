@@ -320,6 +320,43 @@ class QEqSolverFast:
             "force_s": float(force_s),
         }
 
+
+    def compute_with_stress(self, atoms, convergence_tol):
+        if convergence_tol <= 0.0 or not np.isfinite(convergence_tol):
+            raise ValueError("Invalid stress convergence tolerance")
+        if self.include_dipole:
+            raise RuntimeError("Step 1 stress supports 3D bulk/superlattice without dipole correction only")
+        allowed_rc, _ = safe_cutoff(atoms.cell.array)
+        if self.rc > allowed_rc + 1.0e-12:
+            raise RuntimeError("Cell too small for the fixed QEq real-space cutoff")
+        result = self.compute(atoms)
+        if result["convergence_error"] > convergence_tol:
+            raise RuntimeError(f"QEq not converged for stress: {result['convergence_error']}")
+        if abs(result["charge_error"]) > convergence_tol:
+            raise RuntimeError(f"QEq charge constraint failed: {result['charge_error']}")
+        if result["n_pairs"] >= result["pair_capacity"]:
+            raise RuntimeError("QEq pair capacity reached during stress evaluation")
+        positions = jnp.asarray(atoms.positions, dtype=jnp.float64)
+        box = jnp.asarray(atoms.cell.array, dtype=jnp.float64)
+        pairs, _ = self.nbl.build(atoms)
+        charges = jnp.asarray(result["charges"], dtype=jnp.float64)
+        if not hasattr(self, "_strain_grad_fn"):
+            def strained_energy(strain, q, r, h, p, sigma, chi, hardness):
+                transform = jnp.eye(3, dtype=h.dtype) + strain
+                return self.energy_fn(q, r @ transform, h @ transform, p, sigma, chi, hardness)
+            self._strain_grad_fn = jax.jit(jax.grad(strained_energy, argnums=0))
+        derivative = self._strain_grad_fn(
+            jnp.zeros((3, 3), dtype=box.dtype), charges, positions, box,
+            pairs, self.sigma, self.chi, self.hardness,
+        )
+        stress = np.asarray(derivative, dtype=np.float64) / atoms.get_volume()
+        stress = 0.5 * (stress + stress.T)
+        if not np.all(np.isfinite(stress)):
+            raise RuntimeError("Non-finite QEq stress")
+        result["stress"] = stress.flat[[0, 4, 8, 5, 2, 1]].copy()
+        return result
+
+
 def force_vector_rms(forces):
     return float(np.sqrt(np.mean(np.sum(forces ** 2, axis=1))))
 
