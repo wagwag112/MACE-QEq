@@ -62,7 +62,7 @@ DEFAULT_SEED = 0
 DEFAULT_DEVICE = "cuda"
 
 PRODUCTION_QEQ_TOL = 1.0e-4
-PRODUCTION_QEQ_MAXITER = 100
+PRODUCTION_QEQ_MAXITER = int(cfg.MD_QEQ_MAXITER)
 PRODUCTION_PME_POINTS_PER_ANG = 1.2
 PRODUCTION_PME_GRID_BLOCK = 4
 PRODUCTION_PME_GRID_MIN = 16
@@ -347,17 +347,31 @@ class MACEQEqCalculator(Calculator):
         rcut_anion=CONSTP_RCUT_ANION,
         rcut_lili=CONSTP_RCUT_LILI,
         anion_symbol=CONSTP_ANION_ELEMENT,
+        enable_stress=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.mode = str(mode).lower()
+        self.enable_stress = bool(enable_stress)
+        if self.enable_stress:
+            if self.mode != "constq" or atoms.constraints:
+                raise RuntimeError("NPT requires unconstrained ConstQ superlattice")
+            self.implemented_properties = ["energy", "forces", "stress"]
         self.mace = MACECalculator(
             model_paths=[str(model_path)],
             device=device,
         )
+        if self.mode == "full":
+            self.last_qeq = None
+            self.last_constp_diagnostics = None
+            self.electrode_tracker = None
+            return
         self.system = get_system(atoms)
         self.dipole_axis = get_dipole_axis(atoms, self.system)
         self.include_dipole = self.dipole_axis is not None
+        if self.enable_stress:
+            self.include_dipole = False
+            self.dipole_axis = None
         self.pme_points_per_ang = float(pme_points_per_ang)
         self.mesh = production_pme_mesh(atoms, points_per_ang=self.pme_points_per_ang)
         self.qeq_tol = float(qeq_tol)
@@ -435,6 +449,21 @@ class MACEQEqCalculator(Calculator):
         mace_energy = float(mace_atoms.get_potential_energy())
         mace_forces = np.asarray(mace_atoms.get_forces(), dtype=np.float64)
 
+        if self.mode == "full":
+            self.results["energy"] = mace_energy
+            self.results["forces"] = mace_forces
+            return
+
+        if self.enable_stress:
+            required_mesh = production_pme_mesh(atoms, self.pme_points_per_ang)
+            if any(a > b for a, b in zip(required_mesh, self.mesh)) and not getattr(self, "_mesh_warning", False):
+                print(
+                    f"[WARN] Fixed PME mesh {self.mesh}; current cell recommends "
+                    f"{required_mesh}. Check mesh convergence before a long run.",
+                    flush=True,
+                )
+                self._mesh_warning = True
+
         if self.mode == "constq" or (self.bottom_external_chi == 0.0 and self.upper_external_chi == 0.0):
             chi_eff = np.asarray(self.qeq.chi, dtype=np.float64)
             constp_diag = None
@@ -470,7 +499,10 @@ class MACEQEqCalculator(Calculator):
         )
 
         if qeq_updated:
-            qeq = self.qeq.compute(atoms, chi=chi_eff)
+            if self.enable_stress:
+                qeq = self.qeq.compute_with_stress(atoms, self.qeq_tol)
+            else:
+                qeq = self.qeq.compute(atoms, chi=chi_eff)
             self._cached_qeq = qeq
         else:
             qeq = dict(self._cached_qeq)
@@ -483,6 +515,11 @@ class MACEQEqCalculator(Calculator):
 
         self.results["energy"] = mace_energy + qeq_energy
         self.results["forces"] = mace_forces + qeq_forces
+        if self.enable_stress:
+            stress = np.asarray(mace_atoms.get_stress(), dtype=np.float64) + qeq["stress"]
+            if not np.all(np.isfinite(stress)):
+                raise RuntimeError("Non-finite total stress")
+            self.results["stress"] = stress
         self.last_qeq = qeq
         self.last_constp_diagnostics = constp_diag
 
@@ -515,7 +552,9 @@ def zero_fixed_momenta(atoms, fixed_indices):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Unified ConstP / ConstQ MD using MACE-short + QEq.")
-    parser.add_argument("--mode", choices=["constp", "constq"], default="constp")
+    parser.add_argument("--ensemble", choices=["nvt", "npt"], default="nvt")
+    parser.add_argument("--npt-superlattice", action="store_true")
+    parser.add_argument("--mode", choices=["constp", "constq", "full"], default="constp")
     parser.add_argument("--structure", default=str(DEFAULT_STRUCTURE))
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE_K)
@@ -525,7 +564,7 @@ def parse_args():
     parser.add_argument("--save-every", type=int, default=DEFAULT_SAVE_EVERY)
     parser.add_argument("--collision-check-every", type=int, default=0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--planes-per-side", type=int, default=CONSTP_FIXED_PLANES_PER_SIDE)
+    parser.add_argument("--planes-per-side", type=int, default=None)
     parser.add_argument("--plane-tol", type=float, default=CONSTP_FIXED_PLANE_TOL)
     parser.add_argument("--qeq-tol", type=float, default=PRODUCTION_QEQ_TOL)
     parser.add_argument("--pme-points-per-ang", type=float, default=PRODUCTION_PME_POINTS_PER_ANG)
@@ -598,6 +637,34 @@ def restore_tracker(tracker, data):
 
 def main():
     args = parse_args()
+    args.ensemble = "npt" if args.mode == "constq" else "nvt"
+    args.npt_superlattice = args.mode == "constq"
+    if args.mode == "constq":
+        args.planes_per_side = 0
+    elif args.planes_per_side is None:
+        args.planes_per_side = CONSTP_FIXED_PLANES_PER_SIDE
+    if args.mode != "full" and args.qeq_update_every != 3:
+        raise ValueError("ConstP NVT and ConstQ NPT require --qeq-update-every 3")
+    print(
+        f"[MODE] {args.mode}: ensemble={args.ensemble}, "
+        f"planes_per_side={args.planes_per_side}, "
+        f"qeq_update_every={args.qeq_update_every}, "
+        f"qeq_maxiter={PRODUCTION_QEQ_MAXITER}",
+        flush=True,
+    )
+    if args.mode == "constq":
+        print("[GEOMETRY] ConstQ NPT requires a dense superlattice without vacuum.", flush=True)
+    if args.ensemble == "npt":
+        if cfg is None or not all(hasattr(cfg, name) for name in (
+            "NPT_PRESSURE_BAR", "NPT_BAROSTAT_SCALE_GPA", "NPT_PTIME_FS", "MD_QEQ_MAXITER"
+        )):
+            raise RuntimeError("NPT parameters missing from al_config.py")
+        if args.mode != "constq" or args.restart or not args.npt_superlattice:
+            raise ValueError("NPT pilot requires ConstQ, --npt-superlattice and a fresh run")
+        if args.planes_per_side != 0:
+            raise ValueError("NPT superlattice requires --planes-per-side 0")
+        if args.qeq_update_every != 3:
+            raise ValueError("NPT requires --qeq-update-every 3")
     structure_file = Path(args.structure)
     model_file = Path(args.model)
     output_dir = Path(args.output)
@@ -687,6 +754,13 @@ def main():
     else:
         anion_cutoffs = {args.anion_symbol: args.rcut_anion}
 
+    if args.ensemble == "npt":
+        if atoms.constraints or not np.all(atoms.pbc):
+            raise RuntimeError("NPT requires unconstrained 3D periodic superlattice")
+        if not np.allclose(atoms.cell.array, np.diag(np.diag(atoms.cell.array)), atol=1e-10):
+            raise RuntimeError("This NPT pilot supports positive diagonal cells only")
+        if np.any(np.diag(atoms.cell.array) <= 0):
+            raise RuntimeError("Invalid NPT cell")
     needs_fixed = args.mode == "constp" or args.planes_per_side > 0
     if needs_fixed:
         if args.restart:
@@ -747,6 +821,17 @@ def main():
         "pair_capacity_factor": args.pair_capacity_factor,
         "max_pairs": args.max_pairs,
     }
+    if args.ensemble == "npt":
+        identity.update({
+            "ensemble": "npt", "include_dipole": False,
+            "pressure_bar": list(cfg.NPT_PRESSURE_BAR),
+            "barostat_scale_GPa": cfg.NPT_BAROSTAT_SCALE_GPA,
+            "ptime_fs": cfg.NPT_PTIME_FS,
+            "qeq_maxiter": PRODUCTION_QEQ_MAXITER,
+            "mace_dtype": "float64",
+        })
+    elif args.restart and old_metadata is not None and old_metadata.get("ensemble", "nvt") != "nvt":
+        raise RuntimeError("Cannot restart NPT trajectory with the NVT restart path")
     if args.restart and old_metadata is not None:
         incompatible = [k for k, value in identity.items() if old_metadata.get(k) != value]
         if incompatible:
@@ -755,6 +840,7 @@ def main():
         print("[WARN] Legacy run lacks metadata; model and settings cannot all be verified", flush=True)
 
     calc = MACEQEqCalculator(
+        enable_stress=args.ensemble == "npt",
         model_path=model_file,
         atoms=atoms,
         mode=args.mode,
@@ -808,12 +894,29 @@ def main():
     elif old_metadata is None:
         atomic_json(metadata_file, identity)
 
+    mechanical = {}
+    if args.ensemble == "npt":
+        pressure = np.asarray(cfg.NPT_PRESSURE_BAR, dtype=float)
+        scale = float(cfg.NPT_BAROSTAT_SCALE_GPA)
+        ptime = float(cfg.NPT_PTIME_FS)
+        if pressure.shape != (3,) or not np.all(np.isfinite(pressure)):
+            raise ValueError("Invalid NPT pressures")
+        if not np.isfinite(scale) or scale <= 0 or not np.isfinite(ptime) or ptime <= 0:
+            raise ValueError("Invalid NPT barostat inertia")
+        mechanical = {
+            "externalstress": -np.concatenate([pressure, np.zeros(3)]) * units.bar,
+            "mask": np.eye(3, dtype=int),
+        }
+        pfactor = scale * units.GPa * (ptime * units.fs) ** 2
+    else:
+        pfactor = None
     dyn = FixAtomsAwareNPT(
         atoms,
         timestep=args.timestep_fs * units.fs,
         temperature_K=args.temperature,
         ttime=args.ttime_fs * units.fs,
-        pfactor=None,
+        pfactor=pfactor,
+        **mechanical,
     )
 
     traj_file = output_dir / "md.traj"
@@ -862,6 +965,7 @@ def main():
         "max_fixed_momentum",
     ])
 
+    pilot_started = time.perf_counter()
     def save_frame():
         step = restart_step + dyn.get_number_of_steps()
         time_ps = step * args.timestep_fs / 1000.0
@@ -965,6 +1069,21 @@ def main():
             constp_total_switch,
             max_fixed_p,
         ])
+        if args.ensemble == "npt":
+            stress = np.asarray(atoms.get_stress(include_ideal_gas=True))
+            record = {
+                "step": step, "time_ps": time_ps,
+                "elapsed_s": time.perf_counter() - pilot_started,
+                "cell_A": atoms.cell.array.tolist(), "volume_A3": atoms.get_volume(),
+                "pressure_bar_voigt": (-stress / units.bar).tolist(),
+                "pme_mesh": list(calc.mesh),
+                "pme_points_per_A": (np.asarray(calc.mesh) / atoms.cell.lengths()).tolist(),
+                "qeq_residual": calc.last_qeq["convergence_error"],
+                "qeq_iterations": calc.last_qeq["iterations"],
+                "qeq_solve_s": calc.last_qeq["solve_s"],
+            }
+            with open(output_dir / "npt_diagnostics.jsonl", "a") as handle:
+                handle.write(json.dumps(record) + "\n")
         thermo_handle.flush()
         traj.write(atoms)
         write(extxyz_file, atoms, format="extxyz", append=True)
@@ -975,7 +1094,7 @@ def main():
             raise RuntimeError(f"Non-finite trajectory step {step}.")
         if abs(qeq_sum) > 1.0e-6:
             raise RuntimeError(f"Neutrality broken at step {step}: sum(q)={qeq_sum}")
-        if qeq_pairs >= qeq_capacity:
+        if calc.last_qeq is not None and qeq_pairs >= qeq_capacity:
             raise RuntimeError(f"QEq pair list exhausted at step {step}.")
         if temperature_mobile > 3000.0 or fmax > 100.0:
             raise RuntimeError(f"Instability abort at step {step}: Tmob={temperature_mobile:.1f} K, Fmax={fmax:.3f} eV/A.")
@@ -1028,6 +1147,15 @@ def main():
 
     try:
         dyn.run(args.steps)
+    except Exception as exc:
+        snapshot = atoms.copy()
+        snapshot.calc = None
+        try:
+            write(output_dir / "md_abort.vasp", snapshot, format="vasp", direct=True, sort=False)
+        except Exception as save_exc:
+            print(f"[ABORT] Snapshot failed: {save_exc}", flush=True)
+        print(f"[ABORT] Integrator counter={dyn.get_number_of_steps()}; {exc}", flush=True)
+        raise
     finally:
         thermo_handle.close()
         traj.close()
