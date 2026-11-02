@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -A MST115294
-#SBATCH -J constP1_4_0
+#SBATCH -J LPSC_NPT_pilot
 #SBATCH -p 8gpus
 #SBATCH --nodes=1
 #SBATCH --gpus-per-node=1
@@ -12,26 +12,30 @@
 
 set -eo pipefail
 
-PROJ_ROOT="/work/hoang0000/Li_Li3N"
+PROJ_ROOT="/work/hoang0000/Li_Li6PS5Cl"
 CLUSTER_ENV="/work/hoang0000/Li_LPSC/MACE_QEq/active_learning/cluster_config.sh"
 [[ -f "${CLUSTER_ENV}" ]] || CLUSTER_ENV="${PROJ_ROOT}/active_learning/cluster_config.sh"
 DRIVER="${PROJ_ROOT}/active_learning/stages/run_md.py"
 
-TASK_NAME="constP1_6_-2_new"
+TASK_NAME="constP_1_new"
 MODE="constp"
-STRUCT="${PROJ_ROOT}/structures/Li_Li3N_Li_new.vasp"
-MODEL="${PROJ_ROOT}/trained_models/train_short_v1/MACE_short_v1.model"
-STEPS=100000
-RESTART=1
+STRUCT="${PROJ_ROOT}/structures/constP_1_new.vasp"
+MODEL="/work/hoang0000/Li_LPSC/MACE_QEq/train_short_v15/checkpoints/MACE_short_v15_run-20260814.model"
+STEPS=200000
+RESTART=0
 
 TEMP_K=300
 TIMESTEP_FS=1.0
 SAVE_EVERY=100
-COLLISION_CHECK_EVERY=100
-SEED=20261013
+SEED=20261031
 DEVICE="cuda"
 
-PLANES_PER_SIDE=3
+case "${MODE}" in
+    constq) PLANES_PER_SIDE=0 ;;
+    constp) PLANES_PER_SIDE=3 ;;
+    full) PLANES_PER_SIDE=0 ;;
+    *) echo "ERROR: Unsupported MODE=${MODE}" >&2; exit 1 ;;
+esac
 PLANE_TOL=0.35
 PAIR_CAPACITY_FACTOR=1.15
 
@@ -39,8 +43,8 @@ ACTIVE_METAL="Li"
 ANION_CUTOFFS='{"N": 2.50, "P": 2.80, "S": 2.90, "Cl": 3.05}'
 RCUT_METAL=3.50
 
-BOTTOM_EXTERNAL_CHI=6.0
-UPPER_EXTERNAL_CHI=-2.0
+BOTTOM_EXTERNAL_CHI=-2.0
+UPPER_EXTERNAL_CHI=6.0
 
 LOG_DIR="${PROJ_ROOT}/logs"
 OUT_DIR="${PROJ_ROOT}/md_validation/${TASK_NAME}"
@@ -92,13 +96,15 @@ cd "${PROJ_ROOT}"
 
 CMD_ARGS=(
     "--mode=${MODE}"
+    "--qeq-update-every=3"
+    "--qeq-tol=1e-4"
+    "--ttime-fs=20"
     "--structure=${STRUCT}"
     "--model=${MODEL}"
     "--temperature=${TEMP_K}"
     "--steps=${STEPS}"
     "--timestep-fs=${TIMESTEP_FS}"
     "--save-every=${SAVE_EVERY}"
-    "--collision-check-every=${COLLISION_CHECK_EVERY}"
     "--seed=${SEED}"
     "--device=${DEVICE}"
     "--planes-per-side=${PLANES_PER_SIDE}"
