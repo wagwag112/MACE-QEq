@@ -1,11 +1,11 @@
 import os
 from pathlib import Path
 
-PROJECTS_DIR = Path("/scratch/tmp/hdang/projects")
+PROJECTS_DIR = Path("/work/hoang0000/projects/Li_Li6PS5Cl")
 ANODE = os.environ.get("ANODE", "Li")
 SE = os.environ.get("SE", "Li6PS5Cl")
 SYSTEM = f"{ANODE}_{SE}"
-PROJECT_ROOT = PROJECTS_DIR / SYSTEM
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ROOT = PROJECT_ROOT
 
 ROUND = int(os.environ.get("AL_ROUND", "0"))
@@ -299,3 +299,8 @@ DFT_ROOT = ROOT / "DFT"
 DFT_CALC_DIR = DFT_ROOT / f"v{ROUND}" / "cal"
 DFT_TEMPLATE_DIR = ACTIVE_LEARNING_DIR / "template"
 DFT_RUN_SCRIPT = ACTIVE_LEARNING_DIR / "slurm" / "run_dft.sh"
+
+NPT_PRESSURE_BAR = (1.0, 1.0, 100.0)
+NPT_BAROSTAT_SCALE_GPA = 20.0
+NPT_PTIME_FS = 1000.0
+MD_QEQ_MAXITER = 150
