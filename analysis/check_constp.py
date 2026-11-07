@@ -4,17 +4,21 @@ from ase.io import read
 from ase.neighborlist import neighbor_list
 
 traj_file = sys.argv[1] if len(sys.argv) > 1 else "md.traj"
+time_ps = float(sys.argv[2]) if len(sys.argv) > 2 else -1
+frames_per_ps = 10
 traj = read(traj_file, index=":")
 
+if time_ps < 0:
+    end_frame = len(traj) - 1
+else:
+    end_frame = int(round(time_ps * frames_per_ps))
+
+if end_frame >= len(traj) or end_frame < frames_per_ps - 1:
+    raise ValueError(f"Invalid time: {time_ps} ps (available frames: {len(traj)})")
+
 atoms_init = traj[0]
-atoms_curr = traj[-1]
-symbols = np.array(atoms_curr.get_chemical_symbols())
-
-box = atoms_curr.get_cell()
-z_mid = box[2, 2] / 2.0
-
-li_idx = np.where(symbols == "Li")[0]
-li_set = set(li_idx)
+frames_curr = traj[end_frame - frames_per_ps + 1:end_frame + 1]
+symbols = np.array(atoms_init.get_chemical_symbols())
 
 ANION_CUTOFFS = {
     "N": 2.50,
@@ -24,6 +28,9 @@ ANION_CUTOFFS = {
 }
 
 ELECTROLYTE_CN_MIN = 2
+
+li_idx = np.where(symbols == "Li")[0]
+li_set = set(li_idx)
 
 def get_bulk_li(atoms):
     i_li, j_li, d_li = neighbor_list(
@@ -39,90 +46,58 @@ def get_bulk_li(atoms):
 
     return cn
 
-cn_init = get_bulk_li(atoms_init)
-cn_curr = get_bulk_li(atoms_curr)
+def analyze_frame(atoms):
+    cn = get_bulk_li(atoms)
+    pos = atoms.positions
+    z_mid = atoms.get_cell()[2, 2] / 2.0
 
-pos_init = atoms_init.positions
-pos_curr = atoms_curr.positions
+    bottom_li = [
+        i for i in li_idx
+        if pos[i, 2] < z_mid and cn[i] < ELECTROLYTE_CN_MIN
+    ]
+    upper_li = [
+        i for i in li_idx
+        if pos[i, 2] > z_mid and cn[i] < ELECTROLYTE_CN_MIN
+    ]
 
-# Classify electrodes along Z
-# Bottom Li: z < z_mid | Upper Li: z > z_mid
-# Li with CN_anion < 2 is classified as electrode Li
-bottom_li_init = [
-    i for i in li_idx
-    if pos_init[i, 2] < z_mid and cn_init[i] < ELECTROLYTE_CN_MIN
-]
-bottom_li_curr = [
-    i for i in li_idx
-    if pos_curr[i, 2] < z_mid and cn_curr[i] < ELECTROLYTE_CN_MIN
-]
-delta_bottom = len(bottom_li_curr) - len(bottom_li_init)
-
-upper_li_init = [
-    i for i in li_idx
-    if pos_init[i, 2] > z_mid and cn_init[i] < ELECTROLYTE_CN_MIN
-]
-upper_li_curr = [
-    i for i in li_idx
-    if pos_curr[i, 2] > z_mid and cn_curr[i] < ELECTROLYTE_CN_MIN
-]
-delta_upper = len(upper_li_curr) - len(upper_li_init)
-
-# Bulk Li thickness along Z
-if len(bottom_li_curr) > 0:
     thick_bottom = (
-        np.max(pos_curr[bottom_li_curr, 2])
-        - np.min(pos_curr[bottom_li_curr, 2])
+        np.max(pos[bottom_li, 2]) - np.min(pos[bottom_li, 2])
+        if len(bottom_li) > 0 else 0.0
     )
-else:
-    thick_bottom = 0.0
-
-if len(upper_li_curr) > 0:
     thick_upper = (
-        np.max(pos_curr[upper_li_curr, 2])
-        - np.min(pos_curr[upper_li_curr, 2])
+        np.max(pos[upper_li, 2]) - np.min(pos[upper_li, 2])
+        if len(upper_li) > 0 else 0.0
     )
-else:
-    thick_upper = 0.0
 
-# LPSC core integrity along Z
-p_core = [
-    i for i, s in enumerate(symbols)
-    if s == "P" and abs(pos_curr[i, 2] - z_mid) < 8.0
-]
+    return len(bottom_li), len(upper_li), thick_bottom, thick_upper
 
-s_indices = set(np.where(symbols == "S")[0])
-i_p, j_p, d_p = neighbor_list("ijd", atoms_curr, 2.45)
+bottom_init, upper_init, _, _ = analyze_frame(atoms_init)
 
-cn_p = {idx: 0 for idx in p_core}
-for i, j in zip(i_p, j_p):
-    if i in cn_p and j in s_indices:
-        cn_p[i] += 1
+results = np.array([analyze_frame(atoms) for atoms in frames_curr])
+bottom_mean, upper_mean, thick_bottom, thick_upper = np.mean(results, axis=0)
 
-mean_cn_p = (
-    np.mean(list(cn_p.values()))
-    if len(p_core) > 0 else 0.0
-)
+delta_bottom = bottom_mean - bottom_init
+delta_upper = upper_mean - upper_init
 
-print(f"=== ELECTRODE ANALYSIS ALONG Z (Frames: {len(traj)}) ===")
+end_time_ps = end_frame / frames_per_ps
+start_time_ps = (end_frame - frames_per_ps + 1) / frames_per_ps
+
+print(f"=== ELECTRODE ANALYSIS ALONG Z (Time: {end_time_ps:.1f} ps) ===")
+print(f"Averaging: {len(frames_curr)} frames ({start_time_ps:.1f}-{end_time_ps:.1f} ps)")
 print(f"Electrolyte-like Li criterion: CN_anion >= {ELECTROLYTE_CN_MIN}")
 
-print(f"\nBottom Electrode Li (z < {z_mid:.1f} A):")
+print("\nBottom Electrode Li:")
 print(
     f"  - Electrode atoms (CN_anion < {ELECTROLYTE_CN_MIN}): "
-    f"Start = {len(bottom_li_init)}, End = {len(bottom_li_curr)}"
+    f"Start = {bottom_init}, Mean = {bottom_mean:.2f}"
 )
-print(f"  - Atom count change (Delta N): {delta_bottom:+d} atoms")
-print(f"  - Electrode thickness: {thick_bottom:.2f} A")
+print(f"  - Atom count change (Delta N): {delta_bottom:+.2f} atoms")
+print(f"  - Mean electrode thickness: {thick_bottom:.2f} A")
 
-print(f"\nUpper Electrode Li (z > {z_mid:.1f} A):")
+print("\nUpper Electrode Li:")
 print(
     f"  - Electrode atoms (CN_anion < {ELECTROLYTE_CN_MIN}): "
-    f"Start = {len(upper_li_init)}, End = {len(upper_li_curr)}"
+    f"Start = {upper_init}, Mean = {upper_mean:.2f}"
 )
-print(f"  - Atom count change (Delta N): {delta_upper:+d} atoms")
-print(f"  - Electrode thickness: {thick_upper:.2f} A")
-
-print(f"\nLPSC Core Integrity (z_mid +/- 8 A):")
-print(f"  - P atoms in core: {len(p_core)}")
-print(f"  - Mean P-S coordination: {mean_cn_p:.2f}")
+print(f"  - Atom count change (Delta N): {delta_upper:+.2f} atoms")
+print(f"  - Mean electrode thickness: {thick_upper:.2f} A")
