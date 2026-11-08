@@ -1255,7 +1255,10 @@ def main():
         time_ps = step * args.timestep_fs / 1000.0
         epot = float(atoms.get_potential_energy())
         ekin = float(atoms.get_kinetic_energy())
-        temperature_ase = float(atoms.get_temperature())
+        temperature_ase = (
+            float(2.0 * ekin / ((3 * len(mobile_indices) + len(pistons)) * units.kB))
+            if piston_mode else float(atoms.get_temperature())
+        )
         temperature_mobile = kinetic_temperature_from_indices(atoms, mobile_indices)
         forces = np.asarray(atoms.get_forces(), dtype=np.float64)
         fmax = force_max(forces)
