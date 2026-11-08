@@ -26,6 +26,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.npt import NPT
+from ase.md.md import MolecularDynamics
 from ase.calculators.calculator import Calculator, all_changes
 from mace.calculators import MACECalculator
 
@@ -114,6 +115,125 @@ class FixAtomsAwareNPT(NPT):
         else:
             self.tfact = 2.0 / (3.0 * n_mobile * self.temperature * self.ttime * self.ttime)
         self.desiredEkin = 1.5 * (n_mobile if n_fixed > 0 else n_mobile - 1) * self.temperature
+
+
+class RigidZPiston:
+    def __init__(self, atoms, indices):
+        self.indices = np.asarray(indices, dtype=int).copy()
+        if self.indices.ndim != 1 or len(self.indices) == 0:
+            raise ValueError("Piston indices must be a non-empty 1D array.")
+        if len(np.unique(self.indices)) != len(self.indices):
+            raise ValueError("Duplicate piston indices.")
+        if np.any(self.indices < 0) or np.any(self.indices >= len(atoms)):
+            raise ValueError("Piston index outside atom array.")
+        self.masses = np.asarray(atoms.get_masses(), dtype=float)[self.indices].copy()
+        if not np.all(np.isfinite(self.masses)) or np.any(self.masses <= 0.0):
+            raise ValueError("Invalid piston atomic masses.")
+        self.mass = float(self.masses.sum())
+        self.weights = self.masses / self.mass
+        self.reference = atoms.positions[self.indices].copy()
+        self.reference_z = float(self.weights @ self.reference[:, 2])
+
+    def project_positions(self, positions):
+        z = float(self.weights @ positions[self.indices, 2])
+        positions[self.indices] = self.reference
+        positions[self.indices, 2] += z - self.reference_z
+
+    def project_momenta(self, momenta):
+        total_pz = float(momenta[self.indices, 2].sum())
+        momenta[self.indices] = 0.0
+        momenta[self.indices, 2] = self.weights * total_pz
+
+    def project_forces(self, forces, load_z):
+        total_fz = float(forces[self.indices, 2].sum()) + float(load_z)
+        forces[self.indices] = 0.0
+        forces[self.indices, 2] = self.weights * total_fz
+
+
+
+class PistonNVT(MolecularDynamics):
+    def __init__(self, atoms, timestep, temperature_K, ttime, pistons,
+                 pressure_bar, **kwargs):
+        from ase.md.nose_hoover_chain import NoseHooverChainThermostat
+
+        if atoms.constraints:
+            raise ValueError("Piston MD requires no ASE atom constraints.")
+        cell = np.asarray(atoms.cell)
+        if not np.allclose(cell, np.diag(np.diag(cell)), rtol=0.0, atol=1e-10):
+            raise ValueError("Piston MD requires a diagonal cell.")
+        if np.any(np.diag(cell) <= 0.0):
+            raise ValueError("Piston MD requires positive cell lengths.")
+        values = np.asarray([timestep, temperature_K, ttime, pressure_bar])
+        if not np.all(np.isfinite(values)) or np.any(values[:3] <= 0.0) or pressure_bar < 0.0:
+            raise ValueError("Invalid piston MD parameters.")
+        if len(pistons) != 2:
+            raise ValueError("Exactly two pistons are required, bottom then upper.")
+        self.pistons = tuple(pistons)
+        boundary = np.concatenate([p.indices for p in self.pistons])
+        if len(np.unique(boundary)) != len(boundary):
+            raise ValueError("Piston groups overlap.")
+        self.mobile_indices = np.setdiff1d(np.arange(len(atoms)), boundary)
+        if len(self.mobile_indices) == 0:
+            raise ValueError("No mobile atoms for thermostatting.")
+        if self.pistons[0].reference_z >= self.pistons[1].reference_z:
+            raise ValueError("Pistons must be ordered bottom then upper.")
+        self.reference_cell = cell.copy()
+        self.masses = atoms.get_masses()[:, None]
+        self.area = float(cell[0, 0] * cell[1, 1])
+        self.pressure_bar = float(pressure_bar)
+        self.load = self.pressure_bar * units.bar * self.area
+        self.thermostat = NoseHooverChainThermostat(
+            num_atoms_global=len(self.mobile_indices),
+            masses=self.masses[self.mobile_indices],
+            temperature_K=temperature_K, tdamp=ttime, tchain=1, tloop=1,
+        )
+        super().__init__(atoms, timestep=timestep, **kwargs)
+
+    def _mechanical_forces(self):
+        forces = np.asarray(self.atoms.get_forces(), dtype=float).copy()
+        self.pistons[0].project_forces(forces, self.load)
+        self.pistons[1].project_forces(forces, -self.load)
+        if not np.all(np.isfinite(forces)):
+            raise RuntimeError("Non-finite piston MD forces.")
+        return forces
+
+    def step(self, forces=None):
+        if self.atoms.constraints or not np.array_equal(self.atoms.cell, self.reference_cell):
+            raise RuntimeError("Piston MD constraints or cell changed.")
+        momenta = self.atoms.get_momenta()
+        for piston in self.pistons:
+            piston.project_momenta(momenta)
+        mobile = self.mobile_indices
+        momenta[mobile] = self.thermostat.integrate_nhc(
+            momenta[mobile].copy(), self.dt / 2.0)
+        momenta += 0.5 * self.dt * self._mechanical_forces()
+        positions = self.atoms.positions + self.dt * momenta / self.masses
+        for piston in self.pistons:
+            piston.project_positions(positions)
+        self.atoms.set_positions(positions)
+        momenta += 0.5 * self.dt * self._mechanical_forces()
+        momenta[mobile] = self.thermostat.integrate_nhc(
+            momenta[mobile].copy(), self.dt / 2.0)
+        for piston in self.pistons:
+            piston.project_momenta(momenta)
+        if not np.all(np.isfinite(positions)) or not np.all(np.isfinite(momenta)):
+            raise RuntimeError("Non-finite piston MD state.")
+        self.atoms.set_momenta(momenta)
+
+    def thermostat_state(self):
+        return {
+            "eta": self.thermostat._eta.tolist(),
+            "p_eta": self.thermostat._p_eta.tolist(),
+        }
+
+    def restore_thermostat_state(self, state):
+        for name, target in (("eta", self.thermostat._eta),
+                             ("p_eta", self.thermostat._p_eta)):
+            value = np.asarray(state[name], dtype=float)
+            if value.shape != target.shape or not np.all(np.isfinite(value)):
+                raise ValueError("Invalid piston thermostat restart state.")
+            target[:] = value
+
 
 def production_pme_mesh(atoms, points_per_ang=PRODUCTION_PME_POINTS_PER_ANG):
     lengths = np.asarray(atoms.cell.lengths(), dtype=np.float64)
@@ -464,7 +584,7 @@ class MACEQEqCalculator(Calculator):
                 )
                 self._mesh_warning = True
 
-        if self.mode == "constq" or (self.bottom_external_chi == 0.0 and self.upper_external_chi == 0.0):
+        if self.mode == "constq":
             chi_eff = np.asarray(self.qeq.chi, dtype=np.float64)
             constp_diag = None
         else:
@@ -554,7 +674,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Unified ConstP / ConstQ MD using MACE-short + QEq.")
     parser.add_argument("--ensemble", choices=["nvt", "npt"], default="nvt")
     parser.add_argument("--npt-superlattice", action="store_true")
-    parser.add_argument("--mode", choices=["constp", "constq", "full"], default="constp")
+    parser.add_argument("--mode", choices=["constp", "constp_nvt", "constp_piston", "constq", "full"], default="constp")
     parser.add_argument("--structure", default=str(DEFAULT_STRUCTURE))
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE_K)
@@ -565,6 +685,7 @@ def parse_args():
     parser.add_argument("--collision-check-every", type=int, default=0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--planes-per-side", type=int, default=None)
+    parser.add_argument("--piston-pressure-bar", type=float, default=getattr(cfg, "PISTON_PRESSURE_BAR", None))
     parser.add_argument("--plane-tol", type=float, default=CONSTP_FIXED_PLANE_TOL)
     parser.add_argument("--qeq-tol", type=float, default=PRODUCTION_QEQ_TOL)
     parser.add_argument("--pme-points-per-ang", type=float, default=PRODUCTION_PME_POINTS_PER_ANG)
@@ -635,8 +756,85 @@ def restore_tracker(tracker, data):
     tracker.leave_counts = np.array(data["leave_counts"], dtype=np.int64)
 
 
+
+def piston_solver_signature(calc):
+    return {
+        "mesh": list(calc.mesh),
+        "include_dipole": bool(calc.include_dipole),
+        "dipole_axis": calc.dipole_axis,
+        "qeq_maxiter": PRODUCTION_QEQ_MAXITER,
+        "chi": np.asarray(calc.qeq.chi).tolist(),
+        "hardness": np.asarray(calc.qeq.hardness).tolist(),
+        "sigma": np.asarray(calc.qeq.sigma).tolist(),
+    }
+
+
+def piston_checkpoint_data(atoms, dyn, calc, step, identity):
+    from ase.io.jsonio import encode
+
+    data = {
+        "version": 1, "step": int(step), "identity": identity,
+        "positions": atoms.positions.copy(),
+        "momenta": atoms.get_momenta(), "numbers": atoms.numbers.copy(),
+        "masses": atoms.get_masses(), "cell": atoms.cell.array.copy(),
+        "pbc": atoms.pbc.copy(),
+        "references": [p.reference.copy() for p in dyn.pistons],
+        "thermostat": dyn.thermostat_state(),
+        "solver_signature": piston_solver_signature(calc),
+        "pair_capacity": int(calc.qeq.nbl.capacity),
+        "previous_q": calc.qeq.previous_q,
+        "tracker": tracker_data(calc.electrode_tracker, step),
+        "calculator": {name: getattr(calc, name) for name in (
+            "results", "_cached_qeq", "_cached_chi", "_cached_constp_diag",
+            "last_qeq", "last_constp_diagnostics", "qeq_eval_counter")},
+    }
+    payload = json.loads(encode(data))
+    json.dumps(payload, allow_nan=False)
+    return payload
+
+
+def restore_piston_calculator(atoms, calc, state):
+    if state["solver_signature"] != piston_solver_signature(calc):
+        raise RuntimeError("Piston restart QEq solver settings changed.")
+    if calc.qeq.nbl.capacity != state["pair_capacity"]:
+        raise RuntimeError("Piston restart pair capacity changed.")
+    saved = state["calculator"]
+    natoms = len(atoms)
+    required = {
+        "total forces": (saved["results"]["forces"], (natoms, 3)),
+        "cached QEq forces": (saved["_cached_qeq"]["forces"], (natoms, 3)),
+        "cached charges": (saved["_cached_qeq"]["charges"], (natoms,)),
+        "cached chi": (saved["_cached_chi"], (natoms,)),
+        "previous charges": (state["previous_q"], (natoms,)),
+    }
+    for name, (value, shape) in required.items():
+        array = np.asarray(value)
+        if array.shape != shape or not np.all(np.isfinite(array)):
+            raise RuntimeError("Invalid piston restart " + name)
+    if not isinstance(saved["qeq_eval_counter"], int) or saved["qeq_eval_counter"] < 1:
+        raise RuntimeError("Invalid piston restart QEq counter.")
+    for name, value in saved.items():
+        setattr(calc, name, value)
+    calc.qeq.previous_q = np.asarray(state["previous_q"]).copy()
+    calc.atoms = atoms.copy()
+    restore_tracker(calc.electrode_tracker, state["tracker"])
+
+
 def main():
     args = parse_args()
+    requested_mode = args.mode
+    piston_mode = requested_mode == "constp_piston"
+    if requested_mode in ("constp_nvt", "constp_piston"):
+        args.mode = "constp"
+    if piston_mode:
+        if args.piston_pressure_bar is None or not np.isfinite(args.piston_pressure_bar) or args.piston_pressure_bar < 0.0:
+            raise ValueError("Set a finite non-negative PISTON_PRESSURE_BAR or --piston-pressure-bar.")
+        if args.planes_per_side is None:
+            if cfg is None or not hasattr(cfg, "PISTON_PLANES_PER_SIDE"):
+                raise ValueError("PISTON_PLANES_PER_SIDE is missing from al_config.py.")
+            args.planes_per_side = int(cfg.PISTON_PLANES_PER_SIDE)
+        if args.planes_per_side <= 0:
+            raise ValueError("Piston mode requires positive --planes-per-side.")
     args.ensemble = "npt" if args.mode == "constq" else "nvt"
     args.npt_superlattice = args.mode == "constq"
     if args.mode == "constq":
@@ -646,7 +844,7 @@ def main():
     if args.mode != "full" and args.qeq_update_every != 3:
         raise ValueError("ConstP NVT and ConstQ NPT require --qeq-update-every 3")
     print(
-        f"[MODE] {args.mode}: ensemble={args.ensemble}, "
+        f"[MODE] {requested_mode}: ensemble={args.ensemble}, "
         f"planes_per_side={args.planes_per_side}, "
         f"qeq_update_every={args.qeq_update_every}, "
         f"qeq_maxiter={PRODUCTION_QEQ_MAXITER}",
@@ -687,6 +885,9 @@ def main():
 
     metadata_file = output_dir / "md_run_metadata.json"
     tracker_file = output_dir / "md_tracker_state.json"
+    piston_diagnostics_file = output_dir / "piston_diagnostics.jsonl"
+    piston_state_file = output_dir / "md_piston_state.json"
+    piston_state = None
     restart_step = 0
     old_tracker_state = None
     stored_fixed = None
@@ -738,12 +939,38 @@ def main():
             print("[WARN] Legacy run has no tracker state; cumulative switching will restart from zero", flush=True)
         print(f"[RESTART] validated step={restart_step} frames={len(rows)}", flush=True)
     else:
-        existing = [path for path in (traj_file, extxyz_file, thermo_file) if path.exists()]
+        checked_outputs = (traj_file, extxyz_file, thermo_file)
+        if piston_mode:
+            checked_outputs += (piston_diagnostics_file, piston_state_file)
+        existing = [path for path in checked_outputs if path.exists()]
         if existing:
             raise RuntimeError("Output files already exist; use --restart or a new output directory: " + str(existing))
         atoms = read(structure_file, index=0)
 
     natoms = len(atoms)
+    if piston_mode and args.restart:
+        from ase.io.jsonio import decode
+
+        if old_metadata is None or old_tracker_state is None:
+            raise RuntimeError("Piston restart requires metadata and tracker state.")
+        if not piston_state_file.is_file() or not piston_diagnostics_file.is_file():
+            raise RuntimeError("Piston checkpoint or diagnostics file is missing.")
+        piston_state = decode(piston_state_file.read_text())
+        if piston_state["version"] != 1 or piston_state["step"] != restart_step:
+            raise RuntimeError("Piston checkpoint version/step mismatch.")
+        if piston_state["identity"] != old_metadata or piston_state["tracker"] != old_tracker_state:
+            raise RuntimeError("Piston checkpoint metadata/tracker mismatch.")
+        for name, current in (
+            ("positions", atoms.positions), ("momenta", atoms.get_momenta()),
+            ("numbers", atoms.numbers), ("masses", atoms.get_masses()),
+            ("cell", atoms.cell.array), ("pbc", atoms.pbc),
+        ):
+            if not np.array_equal(piston_state[name], current):
+                raise RuntimeError("Piston checkpoint/frame mismatch: " + name)
+        with open(piston_diagnostics_file) as handle:
+            diagnostic_steps = [int(json.loads(line)["step"]) for line in handle]
+        if diagnostic_steps != steps_present:
+            raise RuntimeError("Piston diagnostics/trajectory steps mismatch.")
 
     active_metal = args.active_metal or getattr(cfg, "ACTIVE_METAL", "Li")
     rcut_metal = args.rcut_metal if args.rcut_metal is not None else (args.rcut_lili if args.rcut_lili is not None else getattr(cfg, "RCUT_METAL", 3.50))
@@ -768,9 +995,12 @@ def main():
             if len(original) != natoms or not np.array_equal(original.numbers, atoms.numbers):
                 raise RuntimeError("Restart structure and trajectory have different atoms/order")
             if stored_fixed is not None:
-                fixed_indices = np.asarray(stored_fixed, dtype=int)
                 fixed_bottom_indices = np.asarray(old_metadata["fixed_bottom_indices"], dtype=int)
                 fixed_upper_indices = np.asarray(old_metadata["fixed_upper_indices"], dtype=int)
+                fixed_indices = (
+                    np.sort(np.concatenate([fixed_bottom_indices, fixed_upper_indices]))
+                    if piston_mode else np.asarray(stored_fixed, dtype=int)
+                )
             else:
                 # Legacy trajectories: derive electrode seeds from the original structure, never the final frame.
                 fixed_bottom_indices, fixed_upper_indices, fixed_indices = identify_fixed_metal_planes(
@@ -784,13 +1014,40 @@ def main():
             fixed_bottom_indices, fixed_upper_indices, fixed_indices = identify_fixed_metal_planes(
                 atoms, metal_symbol=active_metal,
                 planes_per_side=args.planes_per_side, plane_tol=args.plane_tol)
-        atoms.set_constraint(FixAtoms(indices=fixed_indices))
+        if piston_mode:
+            current_fixed = fixed_from_constraints(atoms)
+            if atoms.constraints and (
+                any(not isinstance(c, FixAtoms) for c in atoms.constraints)
+                or not np.array_equal(current_fixed, fixed_indices)
+            ):
+                raise RuntimeError("Input constraints disagree with piston groups.")
+            atoms.set_constraint()
+        else:
+            atoms.set_constraint(FixAtoms(indices=fixed_indices))
         mobile_indices = np.setdiff1d(np.arange(natoms, dtype=int), fixed_indices, assume_unique=False)
     else:
         fixed_bottom_indices = np.array([], dtype=int)
         fixed_upper_indices = np.array([], dtype=int)
         fixed_indices = np.array([], dtype=int)
         mobile_indices = np.arange(natoms, dtype=int)
+
+    seed_indices = np.sort(np.concatenate([fixed_bottom_indices, fixed_upper_indices]))
+    pistons = ()
+    if piston_mode:
+        pistons = (
+            RigidZPiston(atoms, fixed_bottom_indices),
+            RigidZPiston(atoms, fixed_upper_indices),
+        )
+        fixed_indices = np.array([], dtype=int)
+        if piston_state is not None:
+            if len(piston_state["references"]) != len(pistons):
+                raise RuntimeError("Piston restart reference count mismatch.")
+            for piston, reference in zip(pistons, piston_state["references"]):
+                reference = np.asarray(reference, dtype=float)
+                if reference.shape != piston.reference.shape or not np.all(np.isfinite(reference)):
+                    raise RuntimeError("Invalid piston restart reference geometry.")
+                piston.reference = reference.copy()
+                piston.reference_z = float(piston.weights @ reference[:, 2])
 
     if len(mobile_indices) == 0:
         raise RuntimeError("All atoms are fixed; no mobile atoms remain.")
@@ -821,6 +1078,17 @@ def main():
         "pair_capacity_factor": args.pair_capacity_factor,
         "max_pairs": args.max_pairs,
     }
+    if piston_mode:
+        identity.update({
+            "mode": requested_mode,
+            "ensemble": "piston",
+            "piston_pressure_bar": float(args.piston_pressure_bar),
+            "piston_bottom_indices": fixed_bottom_indices.tolist(),
+            "piston_upper_indices": fixed_upper_indices.tolist(),
+            "piston_masses_amu": [p.mass for p in pistons],
+            "thermostat": "ase_nose_hoover_chain_mobile_only",
+            "thermostat_chain_length": 1,
+        })
     if args.ensemble == "npt":
         identity.update({
             "ensemble": "npt", "include_dipole": False,
@@ -830,7 +1098,7 @@ def main():
             "qeq_maxiter": PRODUCTION_QEQ_MAXITER,
             "mace_dtype": "float64",
         })
-    elif args.restart and old_metadata is not None and old_metadata.get("ensemble", "nvt") != "nvt":
+    elif args.restart and not piston_mode and old_metadata is not None and old_metadata.get("ensemble", "nvt") != "nvt":
         raise RuntimeError("Cannot restart NPT trajectory with the NVT restart path")
     if args.restart and old_metadata is not None:
         incompatible = [k for k, value in identity.items() if old_metadata.get(k) != value]
@@ -849,7 +1117,7 @@ def main():
         fixed_upper_indices=fixed_upper_indices,
         device=args.device,
         capacity_factor=args.pair_capacity_factor,
-        max_pairs=args.max_pairs,
+        max_pairs=piston_state["pair_capacity"] if piston_state is not None else args.max_pairs,
         bottom_external_chi=args.bottom_external_chi,
         upper_external_chi=args.upper_external_chi,
         qeq_update_every=args.qeq_update_every,
@@ -864,19 +1132,23 @@ def main():
         anion_symbol=args.anion_symbol,
     )
     atoms.calc = calc
+    if piston_state is not None:
+        restore_piston_calculator(atoms, calc, piston_state)
 
     if not args.restart:
         rng = np.random.default_rng(args.seed)
         MaxwellBoltzmannDistribution(atoms, temperature_K=args.temperature, rng=rng)
     if len(fixed_indices) > 0:
         zero_fixed_momenta(atoms, fixed_indices)
+    if piston_mode and not args.restart:
+        zero_fixed_momenta(atoms, seed_indices)
 
     initial_energy = float(atoms.get_potential_energy())
     initial_forces = np.asarray(atoms.get_forces(), dtype=np.float64)
     if not np.isfinite(initial_energy) or not np.all(np.isfinite(initial_forces)):
         raise RuntimeError("Non-finite initial state detected.")
 
-    if args.restart and old_tracker_state is not None and calc.electrode_tracker is not None:
+    if args.restart and not piston_mode and old_tracker_state is not None and calc.electrode_tracker is not None:
         restore_tracker(calc.electrode_tracker, old_tracker_state)
         # The initial force evaluation has already reconstructed ConstP diagnostics.
         # Keep cached data but align cumulative counters with the restored tracker.
@@ -910,14 +1182,26 @@ def main():
         pfactor = scale * units.GPa * (ptime * units.fs) ** 2
     else:
         pfactor = None
-    dyn = FixAtomsAwareNPT(
-        atoms,
-        timestep=args.timestep_fs * units.fs,
-        temperature_K=args.temperature,
-        ttime=args.ttime_fs * units.fs,
-        pfactor=pfactor,
-        **mechanical,
-    )
+    if piston_mode:
+        dyn = PistonNVT(
+            atoms,
+            timestep=args.timestep_fs * units.fs,
+            temperature_K=args.temperature,
+            ttime=args.ttime_fs * units.fs,
+            pistons=pistons,
+            pressure_bar=args.piston_pressure_bar,
+        )
+        if piston_state is not None:
+            dyn.restore_thermostat_state(piston_state["thermostat"])
+    else:
+        dyn = FixAtomsAwareNPT(
+            atoms,
+            timestep=args.timestep_fs * units.fs,
+            temperature_K=args.temperature,
+            ttime=args.ttime_fs * units.fs,
+            pfactor=pfactor,
+            **mechanical,
+        )
 
     traj_file = output_dir / "md.traj"
     extxyz_file = output_dir / "md.extxyz"
@@ -1084,11 +1368,81 @@ def main():
             }
             with open(output_dir / "npt_diagnostics.jsonl", "a") as handle:
                 handle.write(json.dumps(record) + "\n")
+        if piston_mode:
+            if calc.last_constp_diagnostics is None:
+                raise RuntimeError("Piston electrode diagnostics are missing.")
+            electrode_indices = np.asarray(
+                calc.last_constp_diagnostics["electrode_indices"], dtype=int)
+            n_seeds = len(np.intersect1d(seed_indices, electrode_indices))
+            if n_seeds != len(seed_indices):
+                raise RuntimeError("Piston electrode assignment lost seeds.")
+            positions = atoms.positions
+            momenta = atoms.get_momenta()
+            records = []
+            for piston, load_z in zip(pistons, (dyn.load, -dyn.load)):
+                indices = piston.indices
+                z = float(piston.weights @ positions[indices, 2])
+                pz = float(momenta[indices, 2].sum())
+                velocity = np.zeros((len(indices), 3))
+                velocity[:, 2] = pz / piston.mass
+                expected = piston.reference.copy()
+                expected[:, 2] += z - piston.reference_z
+                sample_force = float(forces[indices, 2].sum())
+                records.append({
+                    "z_com_A": z,
+                    "velocity_z_A_per_fs": pz / piston.mass * units.fs,
+                    "mass_amu": piston.mass,
+                    "sample_force_z_eV_A": sample_force,
+                    "load_force_z_eV_A": float(load_z),
+                    "net_force_z_eV_A": sample_force + float(load_z),
+                    "rigid_position_error_A": float(np.max(np.linalg.norm(
+                        positions[indices] - expected, axis=1))),
+                    "rigid_velocity_error_A_per_fs": float(np.max(np.linalg.norm(
+                        momenta[indices] / piston.masses[:, None] - velocity,
+                        axis=1))) * units.fs,
+                })
+            height = records[1]["z_com_A"] - records[0]["z_com_A"]
+            inner_gap = float(
+                positions[pistons[1].indices, 2].min()
+                - positions[pistons[0].indices, 2].max())
+            if height <= 0.0 or inner_gap <= 0.0:
+                raise RuntimeError("Piston groups crossed or overlapped along z.")
+            piston_ekin = float(sum(
+                0.5 * np.sum(momenta[p.indices]**2 / p.masses[:, None])
+                for p in pistons))
+            load_energy = float(dyn.load * height)
+            thermostat_energy = dyn.thermostat.get_thermostat_energy()
+            record = {
+                "step": step,
+                "time_ps": time_ps,
+                "area_A2": dyn.area,
+                "height_com_A": height,
+                "inner_gap_A": inner_gap,
+                "target_pressure_bar": dyn.pressure_bar,
+                "bottom": records[0],
+                "upper": records[1],
+                "bottom_reaction_pressure_bar":
+                    -records[0]["sample_force_z_eV_A"] / (dyn.area * units.bar),
+                "upper_reaction_pressure_bar":
+                    records[1]["sample_force_z_eV_A"] / (dyn.area * units.bar),
+                "temperature_mobile_K": temperature_mobile,
+                "piston_Ekin_eV": piston_ekin,
+                "load_potential_eV": load_energy,
+                "thermostat_energy_eV": thermostat_energy,
+                "energy_with_load_and_thermostat_eV":
+                    epot + ekin + load_energy + thermostat_energy,
+                "n_seeds_in_electrode": n_seeds,
+            }
+            with open(piston_diagnostics_file, "a") as handle:
+                handle.write(json.dumps(record, allow_nan=False) + "\n")
         thermo_handle.flush()
         traj.write(atoms)
         write(extxyz_file, atoms, format="extxyz", append=True)
         if calc.electrode_tracker is not None:
             atomic_json(tracker_file, tracker_data(calc.electrode_tracker, step))
+        if piston_mode:
+            atomic_json(piston_state_file, piston_checkpoint_data(
+                atoms, dyn, calc, step, identity))
 
         if not np.isfinite(epot) or not np.all(np.isfinite(forces)) or not np.isfinite(temperature_mobile):
             raise RuntimeError(f"Non-finite trajectory step {step}.")
