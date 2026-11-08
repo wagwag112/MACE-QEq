@@ -659,8 +659,8 @@ def main():
             "NPT_PRESSURE_BAR", "NPT_BAROSTAT_SCALE_GPA", "NPT_PTIME_FS", "MD_QEQ_MAXITER"
         )):
             raise RuntimeError("NPT parameters missing from al_config.py")
-        if args.mode != "constq" or args.restart or not args.npt_superlattice:
-            raise ValueError("NPT pilot requires ConstQ, --npt-superlattice and a fresh run")
+        if args.mode != "constq" or not args.npt_superlattice:
+            raise ValueError("NPT requires ConstQ and --npt-superlattice")
         if args.planes_per_side != 0:
             raise ValueError("NPT superlattice requires --planes-per-side 0")
         if args.qeq_update_every != 3:
