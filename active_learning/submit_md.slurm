@@ -17,11 +17,11 @@ CLUSTER_ENV="/work/hoang0000/Li_LPSC/MACE_QEq/active_learning/cluster_config.sh"
 [[ -f "${CLUSTER_ENV}" ]] || CLUSTER_ENV="${PROJ_ROOT}/active_learning/cluster_config.sh"
 DRIVER="${PROJ_ROOT}/active_learning/stages/run_md.py"
 
-TASK_NAME="constP_1_new"
-MODE="constp"
-STRUCT="${PROJ_ROOT}/structures/constP_1_new.vasp"
+TASK_NAME="new_constP"
+MODE="constp_piston" #constq; constp_nvt; constp_piston
+STRUCT="${PROJ_ROOT}/structures/new_constP.vasp"
 MODEL="/work/hoang0000/Li_LPSC/MACE_QEq/train_short_v15/checkpoints/MACE_short_v15_run-20260814.model"
-STEPS=200000
+STEPS=100000
 RESTART=0
 
 TEMP_K=300
@@ -32,18 +32,19 @@ DEVICE="cuda"
 
 case "${MODE}" in
     constq) PLANES_PER_SIDE=0 ;;
-    constp) PLANES_PER_SIDE=3 ;;
+    constp|constp_nvt|constp_piston) PLANES_PER_SIDE=2 ;;
     full) PLANES_PER_SIDE=0 ;;
     *) echo "ERROR: Unsupported MODE=${MODE}" >&2; exit 1 ;;
 esac
 PLANE_TOL=0.35
-PAIR_CAPACITY_FACTOR=1.15
+PAIR_CAPACITY_FACTOR=1.1
+PISTON_PRESSURE_BAR=30.0
 
 ACTIVE_METAL="Li"
 ANION_CUTOFFS='{"N": 2.50, "P": 2.80, "S": 2.90, "Cl": 3.05}'
 RCUT_METAL=3.50
 
-BOTTOM_EXTERNAL_CHI=-2.0
+BOTTOM_EXTERNAL_CHI=-3.0
 UPPER_EXTERNAL_CHI=6.0
 
 LOG_DIR="${PROJ_ROOT}/logs"
@@ -120,11 +121,16 @@ if [[ "${RESTART}" == "1" ]]; then
     CMD_ARGS+=("--restart")
 fi
 
-if [[ "${MODE}" == "constp" ]]; then
+if [[ "${MODE}" == "constp" || "${MODE}" == "constp_nvt" || "${MODE}" == "constp_piston" ]]; then
     CMD_ARGS+=(
         "--bottom-external-chi=${BOTTOM_EXTERNAL_CHI}"
         "--upper-external-chi=${UPPER_EXTERNAL_CHI}"
     )
+fi
+
+if [[ "${MODE}" == "constp_piston" ]]; then
+    CMD_ARGS+=("--piston-pressure-bar=${PISTON_PRESSURE_BAR}")
+    echo "[MD] piston_pressure_bar=${PISTON_PRESSURE_BAR}"
 fi
 
 echo "[MD] task=${TASK_NAME} mode=${MODE}"
